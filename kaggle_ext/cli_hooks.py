@@ -17,7 +17,7 @@ from typing import Callable
 
 from . import accounts
 
-OFFLINE_EXTENSION_COMMANDS: set[str] = {"ext", "account", "acct"}
+OFFLINE_EXTENSION_COMMANDS: set[str] = {"ext", "account", "acct", "skill", "SKILL"}
 
 _pre_api_hooks: list[Callable[[], None]] = []
 _root_parser_hooks: list[Callable[[object], None]] = []

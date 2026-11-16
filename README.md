@@ -71,7 +71,23 @@ kaggle ext uninstall            # remove kaggle_ext.pth
 kaggle ext version              # print extension version and environment JSON
 ```
 
-`kaggle ext doctor` and `kaggle account list` work completely **offline and unauthenticated** without printing secret keys or tokens.
+### AI Agent Skill Documentation (`kaggle skill` / `SKILL`)
+
+Upstream `Kaggle/kaggle-cli` distributes `SKILL.md` and `references/*.md` in its GitHub repository rather than inside the PyPI wheel. `kaggle-ext` bundles all 13 upstream reference documents, merges them with `kaggle-ext` multi-account and diagnostics guidance, and serves them completely offline:
+
+```bash
+kaggle skill                          # print augmented SKILL.md
+kaggle skill --list [--json]          # list all upstream & kaggle-ext reference topics
+kaggle skill kernels                  # print Kernels reference (+ -a & TPU notes)
+kaggle skill references/kernels.md    # path-style reference lookup also supported
+kaggle skill account                  # print kaggle-ext multi-account reference
+kaggle skill ext                      # print kaggle-ext diagnostics & skill reference
+kaggle skill --all                    # print SKILL.md + all references combined
+kaggle skill --raw                    # print unaugmented upstream SKILL.md
+kaggle skill --export ./kaggle-cli    # export SKILL.md + references/ directory to disk
+```
+
+`kaggle ext doctor`, `kaggle account list`, and `kaggle skill` work completely **offline and unauthenticated** without printing secret keys or tokens.
 
 ## How Non-Intrusive Wiring Works
 
@@ -85,7 +101,7 @@ kaggle ext version              # print extension version and environment JSON
 
 - **Phase 1 (Done)**: Non-intrusive `.pth` + `sys.meta_path` core, `install.py`/`install.sh`, `kaggle ext {doctor, status, install, uninstall, version}`.
 - **Phase 2 (Done)**: Isolated multi-account management (`kaggle account` / `-a` / `KAGGLE_ACCOUNT`), headless `--url-only` / `--code` PKCE OAuth, token/kaggle.json import, and Wayland (`WAYLAND_DISPLAY`) browser-launch compatibility.
-- **Phase 3 (Next)**: Agent skill documentation command (`kaggle skill`) merging upstream `Kaggle/kaggle-cli` skills with `kaggle-ext`.
+- **Phase 3 (Done)**: Offline AI agent skill & reference command (`kaggle skill`) bundling upstream `Kaggle/kaggle-cli` skills (`SKILL.md` + 13 `references/*.md`), topic lookup, and standalone bundle `--export`.
 
 ## Testing
 

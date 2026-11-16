@@ -29,7 +29,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import kaggle_ext  # noqa: E402
-from kaggle_ext import account_commands, accounts, cli_hooks, commands, diagnostics, inject  # noqa: E402
+from kaggle_ext import (  # noqa: E402
+    account_commands,
+    accounts,
+    cli_hooks,
+    commands,
+    diagnostics,
+    inject,
+    skill_commands,
+    skill_doc,
+)
 
 
 def _clean_env(
@@ -650,6 +659,137 @@ class MultiAccountUnitTests(unittest.TestCase):
                     accounts.clear_startup_override(reset_initial_env=True)
 
 
+class SkillDocTests(unittest.TestCase):
+    """Unit tests for bundled skill assets, Markdown merging, and topic resolution."""
+
+    def test_bundled_skill_and_all_upstream_references_load(self) -> None:
+        base_md = skill_doc.load_base_skill_markdown()
+        self.assertIn("name: kaggle-cli", base_md)
+        self.assertNotIn(skill_doc.SKILL_MARKER, base_md)
+
+        upstream_topics = skill_doc.list_topics(include_extension=False)
+        self.assertEqual(len(upstream_topics), 13)
+        all_topics = skill_doc.list_topics(include_extension=True)
+        self.assertEqual(len(all_topics), 15)
+
+        for entry in upstream_topics:
+            canonical, raw_md = skill_doc.get_topic_markdown(str(entry["topic"]), raw=True)
+            self.assertEqual(canonical, entry["topic"])
+            self.assertTrue(raw_md.strip())
+            self.assertNotIn(skill_doc.TOPIC_EXTENSION_MARKER, raw_md)
+
+    def test_augment_skill_markdown_frontmatter_variants_and_idempotency(self) -> None:
+        base_md = skill_doc.load_base_skill_markdown()
+        augmented = skill_doc.augment_skill_markdown(base_md)
+        self.assertIn(skill_doc.SKILL_MARKER, augmented)
+        self.assertIn("kaggle-ext", augmented.split("\n---\n", 1)[0])
+        self.assertIn("├── account | acct", augmented)
+        self.assertIn("references/account.md", augmented)
+        self.assertIn("references/ext.md", augmented)
+
+        # Idempotent on second call.
+        self.assertEqual(skill_doc.augment_skill_markdown(augmented), augmented)
+
+        # Single-line quoted YAML frontmatter `description: "..."` variant.
+        inline_md = (
+            '---\nname: kaggle-cli\ndescription: "Upstream Kaggle skill."\n---\n\n'
+            "# Kaggle CLI\n\n## Command Tree\n\n```text\nkaggle\n└── search\n```\n\n"
+            "## Reference Map\n\n- [Search](references/search.md)\n"
+        )
+        enriched_inline = skill_doc.augment_skill_markdown(inline_md)
+        fm_header = enriched_inline.split("\n---\n", 1)[0]
+        self.assertIn('description: "Upstream Kaggle skill. With kaggle-ext installed', fm_header)
+        self.assertIn(skill_doc.SKILL_MARKER, enriched_inline)
+        self.assertEqual(skill_doc.augment_skill_markdown(enriched_inline), enriched_inline)
+
+    def test_topic_resolution_aliases_paths_and_errors(self) -> None:
+        expected = {
+            "competitions": "competitions",
+            "c": "competitions",
+            "competitions.md": "competitions",
+            "references/competitions.md": "competitions",
+            "./references/kernels.md": "kernels",
+            "k": "kernels",
+            "config": "configuration",
+            "model-variations-versions": "model_variations_versions",
+            "acct": "account",
+            "references/account.md": "account",
+            "ext": "ext",
+        }
+        for query, want in expected.items():
+            self.assertEqual(skill_doc.resolve_topic(query), want, query)
+
+        self.assertIsNone(skill_doc.resolve_topic("definitely_unknown_topic"))
+
+        canon, kernels_md = skill_doc.get_topic_markdown("references/kernels.md", raw=False)
+        self.assertEqual(canon, "kernels")
+        self.assertIn(skill_doc.TOPIC_EXTENSION_MARKER, kernels_md)
+        self.assertIn("TpuV5E8", kernels_md)
+
+        canon_acct, acct_md = skill_doc.get_topic_markdown("acct", raw=False)
+        self.assertEqual(canon_acct, "account")
+        self.assertIn("--url-only", acct_md)
+
+        with self.assertRaises(KeyError):
+            skill_doc.get_topic_markdown("nonexistent_topic")
+
+        with self.assertRaises(ValueError):
+            skill_doc.get_topic_markdown("account", raw=True)
+
+        with self.assertRaises(ValueError):
+            skill_doc.get_topic_markdown("ext", raw=True)
+
+    def test_export_skill_bundle_and_inject_copies_skill_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_full = tmp_path / "export-full"
+            rep_full = skill_doc.export_skill_bundle(str(bundle_full), raw=False)
+            self.assertEqual(rep_full["file_count"], 16)  # SKILL.md + 15 references
+            self.assertIn(skill_doc.SKILL_MARKER, (bundle_full / "SKILL.md").read_text(encoding="utf-8"))
+            self.assertTrue((bundle_full / "references" / "kernels.md").is_file())
+            self.assertTrue((bundle_full / "references" / "account.md").is_file())
+            self.assertTrue((bundle_full / "references" / "ext.md").is_file())
+
+            bundle_raw = tmp_path / "export-raw"
+            rep_raw = skill_doc.export_skill_bundle(str(bundle_raw), raw=True)
+            self.assertEqual(rep_raw["file_count"], 14)  # SKILL.md + 13 upstream references
+            self.assertNotIn(skill_doc.SKILL_MARKER, (bundle_raw / "SKILL.md").read_text(encoding="utf-8"))
+            self.assertFalse((bundle_raw / "references" / "account.md").exists())
+
+            # Verify inject.ensure(..., copy_source=True) copies `kaggle_ext/skill_data/`.
+            ext_home = tmp_path / "copied-ext-home"
+            site_dir = tmp_path / "site"
+            site_dir.mkdir()
+            with mock.patch.dict(
+                os.environ,
+                {"KAGGLE_EXT_HOME": str(ext_home), "KAGGLE_EXT_SOURCE": str(REPO_ROOT)},
+            ):
+                res = inject.ensure(site_dir=str(site_dir), copy_source=True, link=False, quiet=True)
+                self.assertIsNone(res.get("error"))
+            self.assertTrue((ext_home / "kaggle_ext" / "skill_data" / "SKILL.md").is_file())
+            self.assertTrue(
+                (ext_home / "kaggle_ext" / "skill_data" / "references" / "kernels.md").is_file()
+            )
+
+    def test_future_upstream_skill_subparser_is_wrapped_idempotently(self) -> None:
+        parser = argparse.ArgumentParser(prog="kaggle")
+        subparsers = parser.add_subparsers(dest="command")
+        upstream_skill = subparsers.add_parser("skill")
+        upstream_skill.set_defaults(
+            func=lambda: sys.stdout.write(skill_doc.load_base_skill_markdown())
+        )
+
+        skill_commands.attach_skill_subparser(subparsers)
+        skill_commands.attach_skill_subparser(subparsers)  # idempotent second attach
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upstream_skill.get_default("func")()
+        out = buf.getvalue()
+        self.assertIn("name: kaggle-cli", out)
+        self.assertIn(skill_doc.SKILL_MARKER, out)
+
+
 class RealKaggleCliIntegrationTests(unittest.TestCase):
     """End-to-end hermetic subprocess tests against the installed Kaggle CLI."""
 
@@ -746,7 +886,7 @@ class RealKaggleCliIntegrationTests(unittest.TestCase):
             ver = json.loads(p_ver.stdout)
             self.assertEqual(ver["extension"], kaggle_ext.__version__)
 
-            # 4. `python -m kaggle --help` displays `ext`, `account`, and `-a, --account` in help text.
+            # 4. `python -m kaggle --help` displays `ext`, `account`, `skill`, and `-a, --account`.
             p_help = subprocess.run(
                 [self.REAL_PY, "-m", "kaggle", "--help"],
                 env=env,
@@ -757,7 +897,99 @@ class RealKaggleCliIntegrationTests(unittest.TestCase):
             self.assertEqual(p_help.returncode, 0, p_help.stderr)
             self.assertIn("ext", p_help.stdout)
             self.assertIn("account", p_help.stdout)
+            self.assertIn("skill", p_help.stdout)
             self.assertIn("--account", p_help.stdout)
+
+            # 4b. Unauthenticated `kaggle skill` / `SKILL` / `--list` / topic / `--all` / `--export`.
+            p_skill = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill.returncode, 0, p_skill.stderr)
+            self.assertNotIn("Authentication required", p_skill.stdout + p_skill.stderr)
+            self.assertIn("name: kaggle-cli", p_skill.stdout)
+            self.assertIn(skill_doc.SKILL_MARKER, p_skill.stdout)
+
+            p_skill_raw = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "SKILL", "--raw"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_raw.returncode, 0, p_skill_raw.stderr)
+            self.assertIn("name: kaggle-cli", p_skill_raw.stdout)
+            self.assertNotIn(skill_doc.SKILL_MARKER, p_skill_raw.stdout)
+
+            p_skill_list = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "--list", "--json"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_list.returncode, 0, p_skill_list.stderr)
+            topic_names = {item["topic"] for item in json.loads(p_skill_list.stdout)}
+            self.assertTrue({"kernels", "competitions", "account", "ext"}.issubset(topic_names))
+
+            p_skill_kernels = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "references/kernels.md"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_kernels.returncode, 0, p_skill_kernels.stderr)
+            self.assertIn("# Kernels CLI Reference", p_skill_kernels.stdout)
+            self.assertIn(skill_doc.TOPIC_EXTENSION_MARKER, p_skill_kernels.stdout)
+
+            p_skill_acct = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "account"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_acct.returncode, 0, p_skill_acct.stderr)
+            self.assertIn("# Multi-Account Management CLI Reference", p_skill_acct.stdout)
+
+            p_skill_all = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "--all"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_all.returncode, 0, p_skill_all.stderr)
+            self.assertIn(skill_doc.SKILL_MARKER, p_skill_all.stdout)
+            self.assertIn("<!-- reference: references/competitions.md -->", p_skill_all.stdout)
+            self.assertIn("<!-- reference: references/account.md -->", p_skill_all.stdout)
+
+            export_dest = tmp_path / "exported-skill"
+            p_skill_export = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "--export", str(export_dest)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_skill_export.returncode, 0, p_skill_export.stderr)
+            self.assertTrue((export_dest / "SKILL.md").is_file())
+            self.assertTrue((export_dest / "references" / "kernels.md").is_file())
+            self.assertTrue((export_dest / "references" / "account.md").is_file())
+
+            p_skill_bad = subprocess.run(
+                [self.REAL_PY, "-m", "kaggle", "skill", "no_such_topic"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(p_skill_bad.returncode, 0)
+            self.assertIn("[skill] Unknown topic", p_skill_bad.stderr)
 
             # 5. Native unauthenticated `python -m kaggle config view` preserves upstream exit(1) auth failure.
             p_cfg = subprocess.run(

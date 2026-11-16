@@ -18,7 +18,7 @@
    - 任何扩展代码异常（缺文件、半更新状态、上游 API 签名变更）**绝不允许阻断原生 `kaggle` 命令执行**。
    - `.pth` 入口与 `kaggle_ext_loader.py` / `kaggle_ext.register()` 必须捕获扩展自身异常；默认保持静默或单行告警，仅在 `KAGGLE_EXT_DEBUG=1` 时向 `stderr` 输出完整 traceback 诊断信息。
 4. **底座纯 Python 标准库（Stdlib-Only Core）**
-   - `install.py`、`kaggle_ext_loader.py`、`kaggle_ext/inject.py`、`kaggle_ext/diagnostics.py`、`kaggle_ext/accounts.py` 必须严格仅依赖 Python 3.11+ 标准库，确保任意系统 `python3` 均可完成安装、自检、账户解析与离线诊断。
+   - `install.py`、`kaggle_ext_loader.py`、`kaggle_ext/inject.py`、`kaggle_ext/diagnostics.py`、`kaggle_ext/accounts.py`、`kaggle_ext/skill_doc.py` 与 `kaggle_ext/skill_commands.py` 必须严格仅依赖 Python 3.11+ 标准库，确保任意系统 `python3` 均可完成安装、自检、账户解析、离线诊断与 Skill 文档检索。
 5. **严禁泄露真实凭据**
    - 日志、报错、`kaggle ext doctor` / `--json` 输出及测试断言中，严禁打印或返回真实 `KGAT_*` token、`KGRT_*` refresh token、`kaggle.json` 中的 `key` 字段或 OAuth `access_token`。
 
@@ -40,7 +40,7 @@
 2. **未登录双重报错与离线扩展命令短路**
    - `kaggle/__init__.py`（吞掉 `SystemExit`）和 `kaggle.cli:main()`（`if not api._authenticated: api.authenticate()`）会先后两次调用 `api.authenticate()`，未登录时输出两遍提示并 `exit(1)`。
    - **细节坑**：通过 `python -m kaggle ...` 启动时，`runpy._run_module_as_main` 会先导入 `kaggle/__init__.py` 后再把 `sys.argv[0]` 改写为 `.../kaggle/__main__.py`，导致首次鉴权期间 `sys.argv[0] == "-m"`、上游 `KaggleApi._invoked_as_cli()` 返回 `False`。
-   - **解法**：`cli_hooks.py` 维护 `OFFLINE_EXTENSION_COMMANDS`（首版含 `"ext"`，现含 `"account"`/`"acct"`）与 `_is_kaggle_cli_process()`（同时识别 `KaggleApi._invoked_as_cli()` 与 `sys.argv[0] == "-m"` 且调用栈含 `runpy._run_module_as_main(mod_name in {"kaggle", "kaggle.__main__", "kaggle.cli"})`）。命中离线扩展命令且**未**进入显式 `accounts.account_context()`（`accounts.ACTIVE_ACCOUNT.get() is None`）时，`authenticate()` 直接标记 `self._authenticated = True` 并返回；从而既避免顶层 CLI 鉴权报错，又不影响 `kaggle account status` 内部显式对各账户执行真实 `api.authenticate()` 探测。
+   - **解法**：`cli_hooks.py` 维护 `OFFLINE_EXTENSION_COMMANDS`（首版含 `"ext"`，现含 `"account"`/`"acct"`/`"skill"`/`"SKILL"`）与 `_is_kaggle_cli_process()`（同时识别 `KaggleApi._invoked_as_cli()` 与 `sys.argv[0] == "-m"` 且调用栈含 `runpy._run_module_as_main(mod_name in {"kaggle", "kaggle.__main__", "kaggle.cli"})`）。命中离线扩展命令且**未**进入显式 `accounts.account_context()`（`accounts.ACTIVE_ACCOUNT.get() is None`）时，`authenticate()` 直接标记 `self._authenticated = True` 并返回；从而既避免顶层 CLI 鉴权报错，又不影响 `kaggle account status` 内部显式对各账户执行真实 `api.authenticate()` 探测。
 3. **`kaggle.cli:main()` 局部 `ArgumentParser`、`Help.kaggle_choices` 与 `**command_args` 转发**
    - `kaggle.cli:main()` 在函数体内部创建局部 `parser = argparse.ArgumentParser(...)` 与 `subparsers = parser.add_subparsers(..., dest="command")`，并将 `subparsers.choices = Help.kaggle_choices`（显式 `list`）。
    - 解析后，`main()` **仅删除** `vars(args)` 中的 `"func"`、`"command"`、`"disable_version_warning"`、`"debug"`，随后直接执行 **`args.func(**command_args)`**。
@@ -76,7 +76,10 @@ kaggle-ext/
 │   ├── cli_hooks.py          # 双阶段 Hook 注册中心与 KaggleApi / kagglesdk 隔离拦截器
 │   ├── diagnostics.py        # 离线、只读、脱敏的 Kaggle 凭据与环境体检
 │   ├── account_commands.py   # `kaggle account` (`acct`) 多账户管理与多种登录方式
-│   └── commands.py           # `kaggle ext {doctor,status,install,uninstall,version}`
+│   ├── skill_doc.py          # 离线 AI Agent Skill 文档合并、主题解析与导出引擎（纯 stdlib）
+│   ├── skill_commands.py     # `kaggle skill` (`SKILL`) 命令实现与上游前瞻兼容包装
+│   ├── commands.py           # `kaggle ext {doctor,status,install,uninstall,version}`
+│   └── skill_data/           # 随扩展分发的上游 `Kaggle/kaggle-cli/skills/` Markdown 文档
 └── tests/
     └── test_kaggle_ext.py    # 单元测试 + 真实 `kaggle` 子进程隔离集成测试
 ```
@@ -86,7 +89,7 @@ kaggle-ext/
 - `cli_hooks.register_root_parser_hook(fn)`：在根 `ArgumentParser` 构建完成后、`parse_args()` 前运行（用于注册 `-a / --account` 等全局 flag）。
 - `cli_hooks.register_subparsers_hook(fn, *, choices=..., help_line=...)`：向根 `subparsers` 挂载新命令组（如 `ext`、`account`、`skill`）。
 - `cli_hooks.register_parsed_args_hook(fn)`：在 `parse_args()` 返回后、`args.func(**command_args)` 调用前运行（消费并 `delattr` 扩展全局参数）。
-- `cli_hooks.OFFLINE_EXTENSION_COMMANDS`：无需 Kaggle 登录即可运行的扩展顶层命令集合（含 `"ext"`, `"account"`, `"acct"`）。
+- `cli_hooks.OFFLINE_EXTENSION_COMMANDS`：无需 Kaggle 登录即可运行的扩展顶层命令集合（含 `"ext"`, `"account"`, `"acct"`, `"skill"`, `"SKILL"`）。
 
 ---
 
@@ -94,7 +97,7 @@ kaggle-ext/
 
 - **Phase 1（已完成）**：零侵扰 `.pth` + `sys.meta_path` 注入底座、`install.py` / `install.sh`、`kaggle ext {doctor, status, install, uninstall, version}` 与全套隔离测试。
 - **Phase 2（已完成）**：多账户隔离与切换（`kaggle account` / `acct`、全局 `-a / --account`、`KAGGLE_ACCOUNT`、两步式无头 `--url-only` / `--code` OAuth、Token/kaggle.json 导入及 Wayland 浏览器检测修补），统一隔离 `kaggle.json`、`access_token` 与 `credentials.json`。
-- **Phase 3（下一步）**：`kaggle skill` 命令，动态合并上游 `Kaggle/kaggle-cli/skills/SKILL.md` 与 `kaggle-ext` 扩展命令文档供 AI Agent 检索。
+- **Phase 3（已完成）**：`kaggle skill`（`SKILL`）命令，内置并动态合并上游 `Kaggle/kaggle-cli/skills/`（`SKILL.md` + 13 篇 `references/*.md`）与 `kaggle-ext` 扩展/多账户文档，支持 `--list`、按主题检索（含 `account` / `ext`）、`--all`、`--raw`、`--export` 及 `--json`。
 
 ---
 

@@ -71,7 +71,23 @@ kaggle ext uninstall            # 移除 kaggle_ext.pth
 kaggle ext version              # 输出扩展版本与环境路径 JSON
 ```
 
-`kaggle ext doctor` 与 `kaggle account list` 全程**离线、免登录、只读且脱敏**，绝不输出任何明文密钥/Token。
+### AI Agent Skill 指引与参考文档（`kaggle skill` / `SKILL`）
+
+上游 `Kaggle/kaggle-cli` 的 `SKILL.md` 及 `references/*.md` 仅存于源码仓库、未打包进 PyPI wheel。`kaggle-ext` 离线内置全部 13 篇上游参考文档，并与多账户管理/扩展指引无缝合并：
+
+```bash
+kaggle skill                          # 输出融合 kaggle-ext 说明的完整 SKILL.md
+kaggle skill --list [--json]          # 列出所有上游与扩展参考主题
+kaggle skill kernels                  # 按主题查阅参考文档（支持 alias 与扩展注记）
+kaggle skill references/kernels.md    # 同样支持上游路径写法
+kaggle skill account                  # 查阅 kaggle-ext 多账户参考文档
+kaggle skill ext                      # 查阅 kaggle-ext 自检与 skill 工具文档
+kaggle skill --all                    # 输出 SKILL.md 及全部参考文档合集
+kaggle skill --raw                    # 输出未改动的上游原始 SKILL.md
+kaggle skill --export ./kaggle-cli    # 将 SKILL.md 与 references/ 目录导出到本地
+```
+
+`kaggle ext doctor`、`kaggle account list` 与 `kaggle skill` 全程**离线、免登录、只读且脱敏**，绝不输出任何明文密钥/Token。
 
 ## 无侵扰工作原理
 
@@ -85,7 +101,7 @@ kaggle ext version              # 输出扩展版本与环境路径 JSON
 
 - **Phase 1（已完成）**：无侵扰 `.pth` + `sys.meta_path` 底座、`install.py` / `install.sh`、`kaggle ext {doctor, status, install, uninstall, version}`。
 - **Phase 2（已完成）**：多账户隔离与切换（`kaggle account` / `-a` / `KAGGLE_ACCOUNT`）、无头两步式 PKCE OAuth（`--url-only` / `--code`）、Token/kaggle.json 导入及 Linux Wayland 浏览器唤起兼容。
-- **Phase 3（下一步）**：Agent Skill 指引命令（`kaggle skill`），动态融合上游 `Kaggle/kaggle-cli` 技能文档与扩展指令。
+- **Phase 3（已完成）**：离线 AI Agent Skill 指引命令（`kaggle skill`），内置并融合上游 `Kaggle/kaggle-cli` 技能文档（`SKILL.md` + 13 篇 `references/*.md`）与扩展指令，支持主题检索与 `--export` 导出。
 
 ## 测试
 
