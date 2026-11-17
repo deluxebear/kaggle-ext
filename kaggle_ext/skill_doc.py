@@ -20,7 +20,8 @@ TOPIC_EXTENSION_MARKER = "## `kaggle-ext` Extension Notes"
 
 SKILL_FRONTMATTER_NOTE = (
     "With kaggle-ext installed, also covers isolated multi-account management "
-    "(kaggle account / acct, -a / --account, KAGGLE_ACCOUNT), agent-safe two-step "
+    "(kaggle account / acct, -a / --account, KAGGLE_ACCOUNT), interactive Jupyter "
+    "sessions and WebSocket execution (kaggle session / sess), agent-safe two-step "
     "headless OAuth and token login, offline diagnostics (kaggle ext), and CLI "
     "reference lookup (kaggle skill [topic])."
 )
@@ -81,12 +82,31 @@ kaggle account login work --token-file /path/to/token
 kaggle account login work --kaggle-json /path/to/kaggle.json
 ```
 
+### Interactive Sessions & WebSocket Execution (`kaggle session` / `sess`)
+
+Start or attach to live Kaggle Jupyter sessions backed by a private empty
+placeholder kernel (`QUICK_SAVE`) and execute `.py` / `.ipynb` / inline code in
+memory over a pure-stdlib WebSocket without writing secrets or code to the cloud
+notebook:
+
+```bash
+kaggle session create worker --accelerator NvidiaTeslaT4 --internet
+kaggle session status worker --json
+kaggle session exec worker -f train.ipynb --env-file .env
+kaggle session watch worker --timeout 60
+kaggle session logs worker -n 100
+kaggle session restart worker
+kaggle session stop worker
+```
+
+Run `kaggle skill session` for full hardware aliases, limits, and options.
+
 ### Extension Recovery & Skill Lookup
 
 ```bash
 kaggle ext install [--link]            # re-wire .pth after `uv tool upgrade kaggle`
 kaggle skill --list                    # list all CLI & extension reference topics
-kaggle skill <topic>                   # print reference (e.g. `kaggle skill kernels`, `account`, `ext`)
+kaggle skill <topic>                   # print reference (e.g. `kaggle skill kernels`, `account`, `session`, `ext`)
 kaggle skill --export <dir>            # export SKILL.md and references/ into <dir>
 ```
 
@@ -270,10 +290,92 @@ kaggle skill --list --json         # machine-readable topic catalog
 kaggle skill kernels               # print kernels reference (+ kaggle-ext notes)
 kaggle skill references/auth.md    # path-style reference lookup also works
 kaggle skill account               # multi-account reference
+kaggle skill session               # interactive session & WebSocket reference
 kaggle skill ext                   # extension & skill reference
 kaggle skill --all                 # full SKILL.md + all references
 kaggle skill --export ./kaggle-cli # write SKILL.md + references/ directory
 ```
+"""
+
+SESSION_REFERENCE_MD = """# Interactive Sessions & WebSocket Execution Reference (`kaggle-ext`)
+
+Use `kaggle session` (alias: `kaggle sess`) to provision live interactive Kaggle
+Jupyter containers and execute Python code or `.ipynb` notebooks over WebSocket
+without persisting source code or secrets into cloud kernels.
+
+## Prerequisites & Account Limits
+
+- Authenticated Kaggle account (`kaggle account login <name>`). OAuth or `KGAT_*`
+  tokens are supported (`api.authenticate()` runs per targeted account).
+- Outbound container internet (`--internet`, default on) requires Kaggle phone
+  verification on the account; pass `--no-internet` if unverified.
+- Kaggle enforces weekly GPU/TPU quota (~30h/week), per-account concurrency
+  limits, and ~40-60 minute idle container reclamation. Check remaining quota
+  with `kaggle account status --json`.
+
+## Command Hierarchy
+
+```text
+kaggle session | sess
+├── create | up | start [NAME] [--accelerator SHAPE] [--internet | --no-internet]
+│                              [--slug OWNER/SLUG] [--dataset OWNER/DATASET]
+│                              [--startup-timeout SEC] [--force] [--json]
+├── list | ls [--all-accounts] [--json]           # offline, secret-redacted
+├── status | info [NAME] [--json]                 # HTTP /api/kernels liveness probe
+├── exec | run [NAME] (-c CODE | -f FILE|-) [-e KEY[=VAL]] [--env-file FILE]
+│                     [-t SEC] [--interrupt-on-cancel | --no-interrupt-on-cancel] [--json]
+├── logs | tail [NAME] [-n LINES] [-f] [-t SEC] [--json]
+├── watch | monitor [NAME] [-t SEC] [--json]
+├── restart [NAME] [--json]
+├── interrupt [NAME] [--json]
+└── stop | down | cancel [NAME] [--all] [--force-local] [--json]
+```
+
+## Placeholder Kernel & Isolation Model
+
+- **Private empty placeholder**: Because Kaggle requires an existing kernel
+  entity before starting an interactive session, `kaggle session create` checks or
+  creates `<username>/kaggle-ext-s-<name>` via `SaveKernel` (`is_private=True`,
+  `KernelExecutionType.QUICK_SAVE`) containing only a single empty code cell.
+- **Zero secret persistence in the cloud**: All `--env` / `--env-file` values are
+  injected over the authenticated WebSocket in a preliminary `silent=True,
+  store_history=False` frame before user cells execute, leaving IPython `In[]`
+  history clean and keeping `--env` secrets out of process CLI arguments.
+- **Per-account state**: Session records live in `0600` `sessions.json` inside each
+  account's `0700` directory (`~/.config/kaggle-ext/accounts/<acct>/sessions.json`),
+  locked via `fcntl.flock`. Both `jupyterUrl` path segments (`/k/<id>/<seg>/`)
+  and query tokens (`?token=...`) are redacted in `list`, `status`, `ext doctor`,
+  logs, and error output.
+- **Pinned account routing**: If you omit `-a <account>` and a named session does
+  not exist on the default active account, `kaggle-ext` resolves it uniquely
+  across configured accounts so subsequent `exec`/`status`/`stop` stay pinned to
+  the session's owner account.
+
+## Hardware Accelerator Aliases (`--accelerator`)
+
+| CLI Value | Kaggle `machine_shape` | Notes |
+|---|---|---|
+| `cpu`, `none` (default) | *(unset)* | CPU container, consumes no GPU/TPU quota |
+| `gpu`, `t4`, `t4x2`, `NvidiaTeslaT4` | `NvidiaTeslaT4` | Default Kaggle GPU (2x T4) |
+| `t4-highmem`, `NvidiaTeslaT4Highmem` | `NvidiaTeslaT4Highmem` | High-memory T4 GPU |
+| `tpu`, `tpu-v5e-8`, `TpuV5E8` | `TpuV5E8` | TPU v5e-8 (`docker_image` omitted) |
+
+Other valid PascalCase Kaggle shapes pass through unchanged; retired shapes such
+as `NvidiaTeslaP100` or `TpuV38` emit a warning to stderr.
+
+## Liveness, Monitoring & Safe Shutdown
+
+- `kaggle session status` probes `GET {jupyter_url}/api/kernels` directly
+  (`GetKernelSessionStatus` only tracks saved batch versions and reads `COMPLETE`
+  even while an interactive container is alive). Exit code `1` indicates the
+  session was reclaimed or is unreachable.
+- `kaggle session watch` and `kaggle session logs -f` allocate a fresh monitor
+  `session_id` UUID so attaching a read-only observer never disconnects an
+  in-progress `kaggle session exec` WebSocket.
+- `kaggle session stop` calls `CancelKernelSession` to halt quota billing and
+  removes the local `sessions.json` entry **without** deleting the remote
+  placeholder kernel. If the remote cancel request fails, the local entry is
+  preserved for retry unless `--force-local` is passed.
 """
 
 _TOPIC_NOTES: dict[str, str] = {
@@ -295,6 +397,8 @@ _TOPIC_NOTES: dict[str, str] = {
   `credentials.json`, `_get_apikey_creds`) are all isolated per account.""",
     "kernels": """- Run kernel commands on a specific account without switching global default:
   `kaggle -a work kernels list -m` or `kaggle k push -p ./nb -a work`.
+- For interactive live Jupyter sessions and cell-by-cell WebSocket execution, use
+  `kaggle session` (`kaggle sess`, documented in `kaggle skill session`).
 - When pushing `TpuV5E8` workloads, prefer `"kernel_type": "notebook"` and omit
   stale `"docker_image"` / `"docker_image_pinning_type"` pins; upstream Kaggle
   batch `SaveKernel` runs may still schedule a CPU image on some accounts, so
@@ -437,6 +541,14 @@ TOPIC_SPECS: tuple[TopicSpec, ...] = (
         upstream=False,
     ),
     TopicSpec(
+        name="session",
+        title="Interactive Sessions & WebSocket Execution (kaggle-ext)",
+        summary="Live Kaggle Jupyter sessions, private placeholder lifecycle, RFC 6455 WebSocket execution, env injection, and monitoring.",
+        aliases=("sess", "sessions", "ws", "jupyter"),
+        filename="session.md",
+        upstream=False,
+    ),
+    TopicSpec(
         name="ext",
         title="Extension & Skill CLI (kaggle-ext)",
         summary="Offline doctor diagnostics, .pth wiring recovery, and skill documentation export.",
@@ -445,6 +557,12 @@ TOPIC_SPECS: tuple[TopicSpec, ...] = (
         upstream=False,
     ),
 )
+
+_EXTENSION_TOPIC_DOCS: dict[str, str] = {
+    "account": ACCOUNT_REFERENCE_MD,
+    "session": SESSION_REFERENCE_MD,
+    "ext": EXT_REFERENCE_MD,
+}
 
 _TOPIC_BY_NAME: dict[str, TopicSpec] = {spec.name: spec for spec in TOPIC_SPECS}
 _TOPIC_ALIASES: dict[str, str] = {}
@@ -456,6 +574,8 @@ for _spec in TOPIC_SPECS:
 _EXTENSION_TREE_REPLACEMENT = """├── search
 ├── account | acct
 │   └── list, current, status, use, add, login, logout, rename, remove
+├── session | sess
+│   └── create|up, list|ls, status|info, exec|run, logs|tail, watch, restart, interrupt, stop|down
 ├── ext {doctor, status, install, uninstall, version}
 └── skill [topic] [--list] [--all] [--raw] [--export DIR]"""
 
@@ -576,10 +696,11 @@ def _augment_reference_map(md_text: str) -> str:
 
     extra_lines = (
         "\n- [Account Management (kaggle-ext)](references/account.md) - isolated multi-account switching (`-a`/`--account`), headless PKCE/token login, and parallel GPU/TPU quota checks."
+        "\n- [Interactive Sessions (kaggle-ext)](references/session.md) - live Kaggle Jupyter containers, private placeholder lifecycle, RFC 6455 WebSocket execution, and monitoring."
         "\n- [Extension & Skill CLI (kaggle-ext)](references/ext.md) - offline `kaggle ext doctor` diagnostics, `.pth` wiring recovery, and `kaggle skill` lookup/export."
         "\n\nCLI shortcut: read any topic directly without locating files on disk using "
         "`kaggle skill <topic>` (e.g. `kaggle skill kernels`, `kaggle skill references/auth.md`, "
-        "`kaggle skill account`), list all topics with `kaggle skill --list`, or write a full "
+        "`kaggle skill account`, `kaggle skill session`), list all topics with `kaggle skill --list`, or write a full "
         "directory bundle with `kaggle skill --export <dir>`."
     )
     section = section.rstrip("\n") + extra_lines + "\n"
@@ -670,7 +791,7 @@ def get_topic_markdown(topic: str, *, raw: bool = False) -> tuple[str, str]:
             raise ValueError(
                 f"Topic '{canonical}' is provided by kaggle-ext and has no upstream --raw file."
             )
-        content = ACCOUNT_REFERENCE_MD if canonical == "account" else EXT_REFERENCE_MD
+        content = _EXTENSION_TOPIC_DOCS[canonical]
         return canonical, content.rstrip() + "\n"
 
     ref_path = REFERENCES_DATA_DIR / spec.filename

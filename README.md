@@ -71,6 +71,23 @@ kaggle ext uninstall            # remove kaggle_ext.pth
 kaggle ext version              # print extension version and environment JSON
 ```
 
+### Interactive Sessions & WebSocket Execution (`kaggle session` / `sess`)
+
+Provision live Kaggle Jupyter containers backed by private empty `QUICK_SAVE` placeholders (`<username>/kaggle-ext-s-<name>`) and run `.py` / `.ipynb` / inline code over a pure-stdlib RFC 6455 WebSocket without saving code or secrets to Kaggle:
+
+```bash
+kaggle session create worker --accelerator NvidiaTeslaT4 --internet
+kaggle session list [--all-accounts] [--json]
+kaggle session status worker [--json]
+kaggle session exec worker -f train.ipynb --env-file .env
+kaggle session exec worker -c "print('hello')" --env API_KEY
+kaggle session watch worker [--timeout 60] [--json]
+kaggle session logs worker [-n 100] [-f]
+kaggle session restart worker
+kaggle session interrupt worker
+kaggle session stop worker [--all]
+```
+
 ### AI Agent Skill Documentation (`kaggle skill` / `SKILL`)
 
 Upstream `Kaggle/kaggle-cli` distributes `SKILL.md` and `references/*.md` in its GitHub repository rather than inside the PyPI wheel. `kaggle-ext` bundles all 13 upstream reference documents, merges them with `kaggle-ext` multi-account and diagnostics guidance, and serves them completely offline:
@@ -102,6 +119,7 @@ kaggle skill --export ./kaggle-cli    # export SKILL.md + references/ directory 
 - **Phase 1 (Done)**: Non-intrusive `.pth` + `sys.meta_path` core, `install.py`/`install.sh`, `kaggle ext {doctor, status, install, uninstall, version}`.
 - **Phase 2 (Done)**: Isolated multi-account management (`kaggle account` / `-a` / `KAGGLE_ACCOUNT`), headless `--url-only` / `--code` PKCE OAuth, token/kaggle.json import, and Wayland (`WAYLAND_DISPLAY`) browser-launch compatibility.
 - **Phase 3 (Done)**: Offline AI agent skill & reference command (`kaggle skill`) bundling upstream `Kaggle/kaggle-cli` skills (`SKILL.md` + 13 `references/*.md`), topic lookup, and standalone bundle `--export`.
+- **Phase 4 (Done)**: Interactive Jupyter sessions & pure-stdlib RFC 6455 WebSocket execution/monitoring (`kaggle session` / `sess`) with private `QUICK_SAVE` placeholders, per-account `0600` `sessions.json`, hidden-frame `--env` injection, and redacted proxy URLs.
 
 ## Testing
 

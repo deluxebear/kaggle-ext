@@ -9,18 +9,26 @@ Real `~/.kaggle`, `~/.config/kaggle`, `~/.kaggle-ext`, and real `uv` tool
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import hashlib
+import http.server
 import importlib
 import importlib.util
 import io
 import json
 import os
+import socket
+import socketserver
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -36,6 +44,10 @@ from kaggle_ext import (  # noqa: E402
     commands,
     diagnostics,
     inject,
+    session_client,
+    session_commands,
+    session_ws,
+    sessions,
     skill_commands,
     skill_doc,
 )
@@ -63,6 +75,7 @@ def _clean_env(
         "KAGGLE_ACCOUNT",
         "KAGGLE_EXT_SOURCE",
         "KAGGLE_EXT_DEBUG",
+        "KAGGLE_EXT_API_ENDPOINT",
         "DISPLAY",
         "WAYLAND_DISPLAY",
     ):
@@ -670,7 +683,7 @@ class SkillDocTests(unittest.TestCase):
         upstream_topics = skill_doc.list_topics(include_extension=False)
         self.assertEqual(len(upstream_topics), 13)
         all_topics = skill_doc.list_topics(include_extension=True)
-        self.assertEqual(len(all_topics), 15)
+        self.assertEqual(len(all_topics), 16)
 
         for entry in upstream_topics:
             canonical, raw_md = skill_doc.get_topic_markdown(str(entry["topic"]), raw=True)
@@ -684,7 +697,9 @@ class SkillDocTests(unittest.TestCase):
         self.assertIn(skill_doc.SKILL_MARKER, augmented)
         self.assertIn("kaggle-ext", augmented.split("\n---\n", 1)[0])
         self.assertIn("├── account | acct", augmented)
+        self.assertIn("├── session | sess", augmented)
         self.assertIn("references/account.md", augmented)
+        self.assertIn("references/session.md", augmented)
         self.assertIn("references/ext.md", augmented)
 
         # Idempotent on second call.
@@ -714,6 +729,8 @@ class SkillDocTests(unittest.TestCase):
             "model-variations-versions": "model_variations_versions",
             "acct": "account",
             "references/account.md": "account",
+            "sess": "session",
+            "references/session.md": "session",
             "ext": "ext",
         }
         for query, want in expected.items():
@@ -730,11 +747,18 @@ class SkillDocTests(unittest.TestCase):
         self.assertEqual(canon_acct, "account")
         self.assertIn("--url-only", acct_md)
 
+        canon_sess, sess_md = skill_doc.get_topic_markdown("sess", raw=False)
+        self.assertEqual(canon_sess, "session")
+        self.assertIn("QUICK_SAVE", sess_md)
+
         with self.assertRaises(KeyError):
             skill_doc.get_topic_markdown("nonexistent_topic")
 
         with self.assertRaises(ValueError):
             skill_doc.get_topic_markdown("account", raw=True)
+
+        with self.assertRaises(ValueError):
+            skill_doc.get_topic_markdown("session", raw=True)
 
         with self.assertRaises(ValueError):
             skill_doc.get_topic_markdown("ext", raw=True)
@@ -744,10 +768,11 @@ class SkillDocTests(unittest.TestCase):
             tmp_path = Path(tmp)
             bundle_full = tmp_path / "export-full"
             rep_full = skill_doc.export_skill_bundle(str(bundle_full), raw=False)
-            self.assertEqual(rep_full["file_count"], 16)  # SKILL.md + 15 references
+            self.assertEqual(rep_full["file_count"], 17)  # SKILL.md + 16 references
             self.assertIn(skill_doc.SKILL_MARKER, (bundle_full / "SKILL.md").read_text(encoding="utf-8"))
             self.assertTrue((bundle_full / "references" / "kernels.md").is_file())
             self.assertTrue((bundle_full / "references" / "account.md").is_file())
+            self.assertTrue((bundle_full / "references" / "session.md").is_file())
             self.assertTrue((bundle_full / "references" / "ext.md").is_file())
 
             bundle_raw = tmp_path / "export-raw"
@@ -897,6 +922,7 @@ class RealKaggleCliIntegrationTests(unittest.TestCase):
             self.assertEqual(p_help.returncode, 0, p_help.stderr)
             self.assertIn("ext", p_help.stdout)
             self.assertIn("account", p_help.stdout)
+            self.assertIn("session", p_help.stdout)
             self.assertIn("skill", p_help.stdout)
             self.assertIn("--account", p_help.stdout)
 
@@ -933,7 +959,7 @@ class RealKaggleCliIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(p_skill_list.returncode, 0, p_skill_list.stderr)
             topic_names = {item["topic"] for item in json.loads(p_skill_list.stdout)}
-            self.assertTrue({"kernels", "competitions", "account", "ext"}.issubset(topic_names))
+            self.assertTrue({"kernels", "competitions", "account", "session", "ext"}.issubset(topic_names))
 
             p_skill_kernels = subprocess.run(
                 [self.REAL_PY, "-m", "kaggle", "skill", "references/kernels.md"],
@@ -1120,6 +1146,976 @@ class RealKaggleCliIntegrationTests(unittest.TestCase):
             self.assertNotEqual(p_bad.returncode, 0)
             self.assertIn("[account] Unknown account", p_bad.stderr)
             self.assertNotIn("Authentication required", p_bad.stdout + p_bad.stderr)
+
+
+# --------------------------------------------------------------------------------------
+# Phase 4: Interactive Session & Loopback HTTP/WebSocket Harness Tests
+# --------------------------------------------------------------------------------------
+
+
+def _ws_encode_server_frame(opcode: int, payload: bytes) -> bytes:
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n <= 0xFFFF:
+        header.append(126)
+        header.extend(n.to_bytes(2, "big"))
+    else:
+        header.append(127)
+        header.extend(n.to_bytes(8, "big"))
+    return bytes(header) + payload
+
+
+def _ws_read_client_frame(rfile) -> tuple[int, bytes] | None:
+    head = rfile.read(2)
+    if not head or len(head) < 2:
+        return None
+    b0, b1 = head[0], head[1]
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    length = b1 & 0x7F
+    if length == 126:
+        length = int.from_bytes(rfile.read(2), "big")
+    elif length == 127:
+        length = int.from_bytes(rfile.read(8), "big")
+    mask_key = rfile.read(4) if masked else b""
+    payload = rfile.read(length) if length else b""
+    if masked and payload:
+        repeated = (mask_key * ((length // 4) + 1))[:length]
+        payload = (int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")).to_bytes(
+            length, "big"
+        )
+    return opcode, payload
+
+
+class _LoopbackClusterState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.proxy_port = 0
+        self.proxy_secret = "secretseg1234567890"
+        self.query_secret = "querysecret999"
+        self.next_ksid = 370558104
+        self.kernels: dict[str, dict[str, object]] = {}
+        self.save_calls: list[dict[str, object]] = []
+        self.create_session_calls: list[dict[str, object]] = []
+        self.cancel_calls: list[int] = []
+        self.delete_calls: int = 0
+        self.fail_cancel_code: int | None = None
+        self.ops: dict[str, dict[str, object]] = {}
+        self.live_sessions: dict[int, dict[str, object]] = {}
+        self.ws_clients: dict[int, dict[str, tuple[socket.socket, threading.Lock]]] = {}
+        self.ws_connect_history: list[tuple[int, str]] = []
+        self.ws_connected_event = threading.Event()
+        self.session_id_kicks: int = 0
+        self.restarts: int = 0
+        self.interrupts: int = 0
+        self.interrupt_event = threading.Event()
+
+    def register_ws(self, ksid: int, sid: str, sock: socket.socket, wlock: threading.Lock) -> None:
+        with self.lock:
+            bucket = self.ws_clients.setdefault(ksid, {})
+            old = bucket.get(sid)
+            if old is not None:
+                self.session_id_kicks += 1
+                with contextlib.suppress(OSError):
+                    old[0].close()
+            bucket[sid] = (sock, wlock)
+            self.ws_connect_history.append((ksid, sid))
+            self.ws_connected_event.set()
+
+    def unregister_ws(self, ksid: int, sid: str, sock: socket.socket) -> None:
+        with self.lock:
+            bucket = self.ws_clients.get(ksid, {})
+            cur = bucket.get(sid)
+            if cur is not None and cur[0] is sock:
+                bucket.pop(sid, None)
+
+    def broadcast_iopub(self, ksid: int, msg_dict: dict[str, object]) -> None:
+        frame = _ws_encode_server_frame(0x1, json.dumps(msg_dict).encode("utf-8"))
+        with self.lock:
+            targets = list(self.ws_clients.get(ksid, {}).values())
+        for sock, wlock in targets:
+            with wlock:
+                with contextlib.suppress(OSError):
+                    sock.sendall(frame)
+
+    def close_all_ws(self) -> None:
+        with self.lock:
+            socks = [s for b in self.ws_clients.values() for s, _lk in b.values()]
+            self.ws_clients.clear()
+        for sock in socks:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _LoopbackKaggleCluster:
+    """Self-contained loopback Kaggle Proto-RPC + Jupyter Proxy HTTP/WebSocket server."""
+
+    def __init__(self) -> None:
+        self.state = _LoopbackClusterState()
+        self._rpc_server: _ThreadingHTTPServer | None = None
+        self._proxy_server: _ThreadingHTTPServer | None = None
+        self._rpc_thread: threading.Thread | None = None
+        self._proxy_thread: threading.Thread | None = None
+        self.rpc_url = ""
+        self.proxy_port = 0
+
+    def __enter__(self) -> "_LoopbackKaggleCluster":
+        state = self.state
+
+        class ProxyHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args) -> None:  # noqa: A002
+                return
+
+            def _send_json(self, code: int, obj: object) -> None:
+                body = json.dumps(obj).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _parse_proxy_route(self) -> tuple[int, str, dict[str, list[str]]] | None:
+                parsed = urllib.parse.urlsplit(self.path)
+                parts = [p for p in parsed.path.split("/") if p]
+                if (
+                    len(parts) < 4
+                    or parts[0] != "k"
+                    or not parts[1].isdigit()
+                    or parts[2] != state.proxy_secret
+                    or parts[3] != "proxy"
+                ):
+                    self._send_json(404, {"error": "not found"})
+                    return None
+                ksid = int(parts[1])
+                with state.lock:
+                    sess = state.live_sessions.get(ksid)
+                if sess is None or not sess.get("alive"):
+                    self._send_json(404, {"error": "session gone"})
+                    return None
+                sub = "/" + "/".join(parts[4:])
+                qs = urllib.parse.parse_qs(parsed.query)
+                return ksid, sub, qs
+
+            def do_GET(self) -> None:
+                route = self._parse_proxy_route()
+                if route is None:
+                    return
+                ksid, sub, qs = route
+                with state.lock:
+                    sess = state.live_sessions[ksid]
+                    kid = str(sess["kernel_id"])
+                if sub == "/api/status":
+                    self._send_json(200, {"connections": 0, "kernels": 1})
+                    return
+                if sub == "/api/kernels":
+                    self._send_json(
+                        200,
+                        [{"id": kid, "name": "python3", "execution_state": "idle", "connections": 0}],
+                    )
+                    return
+                if sub == f"/api/kernels/{kid}":
+                    self._send_json(
+                        200,
+                        {"id": kid, "name": "python3", "execution_state": "idle", "connections": 0},
+                    )
+                    return
+                if sub == f"/api/kernels/{kid}/channels":
+                    if (self.headers.get("Upgrade") or "").lower() != "websocket":
+                        self._send_json(400, {"error": "upgrade required"})
+                        return
+                    ws_key = self.headers.get("Sec-WebSocket-Key") or ""
+                    accept = base64.b64encode(
+                        hashlib.sha1((ws_key + session_ws._WS_GUID).encode("ascii")).digest()
+                    ).decode("ascii")
+                    self.send_response(101, "Switching Protocols")
+                    self.send_header("Upgrade", "websocket")
+                    self.send_header("Connection", "Upgrade")
+                    self.send_header("Sec-WebSocket-Accept", accept)
+                    self.end_headers()
+                    self.wfile.flush()
+                    self.close_connection = True
+                    sid = (qs.get("session_id") or [f"anon-{time.time()}"])[0]
+                    self._serve_ws(ksid, sid, sess)
+                    return
+                self._send_json(404, {"error": "unknown route"})
+
+            def do_POST(self) -> None:
+                route = self._parse_proxy_route()
+                if route is None:
+                    return
+                ksid, sub, _qs = route
+                length = int(self.headers.get("Content-Length") or "0")
+                if length:
+                    _ = self.rfile.read(length)
+                with state.lock:
+                    sess = state.live_sessions[ksid]
+                    kid = str(sess["kernel_id"])
+                if sub == "/api/kernels":
+                    self._send_json(
+                        201,
+                        {"id": kid, "name": "python3", "execution_state": "idle", "connections": 0},
+                    )
+                    return
+                if sub == f"/api/kernels/{kid}/restart":
+                    with state.lock:
+                        state.restarts += 1
+                        sess["env"].clear()
+                    self._send_json(
+                        200,
+                        {"id": kid, "name": "python3", "execution_state": "idle", "connections": 0},
+                    )
+                    return
+                if sub == f"/api/kernels/{kid}/interrupt":
+                    with state.lock:
+                        state.interrupts += 1
+                        state.interrupt_event.set()
+                    self._send_json(200, {})
+                    return
+                self._send_json(404, {"error": "unknown POST route"})
+
+            def _serve_ws(self, ksid: int, sid: str, sess: dict[str, object]) -> None:
+                wlock = threading.Lock()
+                sock = self.connection
+                state.register_ws(ksid, sid, sock, wlock)
+                try:
+                    while True:
+                        frame = _ws_read_client_frame(self.rfile)
+                        if frame is None:
+                            break
+                        opcode, payload = frame
+                        if opcode == 0x8:
+                            with wlock:
+                                with contextlib.suppress(OSError):
+                                    sock.sendall(_ws_encode_server_frame(0x8, (1000).to_bytes(2, "big")))
+                            break
+                        if opcode == 0x9:
+                            with wlock:
+                                with contextlib.suppress(OSError):
+                                    sock.sendall(_ws_encode_server_frame(0xA, payload[:125]))
+                            continue
+                        if opcode != 0x1:
+                            continue
+                        msg = json.loads(payload.decode("utf-8"))
+                        if msg.get("msg_type") != "execute_request":
+                            continue
+                        self._handle_execute_request(ksid, sock, wlock, sess, msg)
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    state.unregister_ws(ksid, sid, sock)
+
+            def _handle_execute_request(
+                self,
+                ksid: int,
+                sock: socket.socket,
+                wlock: threading.Lock,
+                sess: dict[str, object],
+                req: dict[str, object],
+            ) -> None:
+                parent_hdr = req.get("header") or {}
+                parent_id = parent_hdr.get("msg_id") if isinstance(parent_hdr, dict) else ""
+                content = req.get("content") or {}
+                code = str(content.get("code") or "")
+                silent = bool(content.get("silent", False))
+                store_history = bool(content.get("store_history", True))
+
+                state.broadcast_iopub(
+                    ksid,
+                    {
+                        "channel": "iopub",
+                        "msg_type": "status",
+                        "header": {"msg_type": "status"},
+                        "parent_header": {"msg_id": parent_id},
+                        "content": {"execution_state": "busy"},
+                    },
+                )
+
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                exec_status = "ok"
+                ename = ""
+                evalue = ""
+
+                fake_os = types.SimpleNamespace(environ=sess["env"])
+                fake_sys = types.SimpleNamespace(stdout=out_buf, stderr=err_buf, version=sys.version)
+
+                def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+                    if name == "os":
+                        return fake_os
+                    if name == "sys":
+                        return fake_sys
+                    return __import__(name, globals, locals, fromlist, level)
+
+                def _fake_print(*args, **kwargs):
+                    sep = kwargs.get("sep", " ")
+                    end = kwargs.get("end", "\n")
+                    target = kwargs.get("file") or out_buf
+                    target.write(sep.join(str(a) for a in args) + end)
+
+                safe_builtins = dict(__builtins__) if isinstance(__builtins__, dict) else dict(vars(__builtins__))
+                safe_builtins["__import__"] = _fake_import
+                safe_builtins["print"] = _fake_print
+
+                if store_history:
+                    sess["In"].append(code)
+                exec_ns = {"__builtins__": safe_builtins, "In": sess["In"], "os": fake_os, "sys": fake_sys}
+
+                try:
+                    if "# SLEEP_UNTIL_INTERRUPT" in code:
+                        state.interrupt_event.clear()
+                        if state.interrupt_event.wait(timeout=10.0):
+                            raise KeyboardInterrupt("Interrupted by user")
+                        raise TimeoutError("Mock sleep finished")
+                    exec(compile(code, "<cell>", "exec"), exec_ns, exec_ns)
+                except BaseException as exc:
+                    exec_status = "error"
+                    ename = type(exc).__name__
+                    evalue = str(exc)
+
+                if not silent:
+                    out_txt = out_buf.getvalue()
+                    if out_txt:
+                        state.broadcast_iopub(
+                            ksid,
+                            {
+                                "channel": "iopub",
+                                "msg_type": "stream",
+                                "header": {"msg_type": "stream"},
+                                "parent_header": {"msg_id": parent_id},
+                                "content": {"name": "stdout", "text": out_txt},
+                            },
+                        )
+                    err_txt = err_buf.getvalue()
+                    if err_txt:
+                        state.broadcast_iopub(
+                            ksid,
+                            {
+                                "channel": "iopub",
+                                "msg_type": "stream",
+                                "header": {"msg_type": "stream"},
+                                "parent_header": {"msg_id": parent_id},
+                                "content": {"name": "stderr", "text": err_txt},
+                            },
+                        )
+
+                if exec_status == "error":
+                    state.broadcast_iopub(
+                        ksid,
+                        {
+                            "channel": "iopub",
+                            "msg_type": "error",
+                            "header": {"msg_type": "error"},
+                            "parent_header": {"msg_id": parent_id},
+                            "content": {
+                                "ename": ename,
+                                "evalue": evalue,
+                                "traceback": [f"{ename}: {evalue}"],
+                            },
+                        },
+                    )
+
+                state.broadcast_iopub(
+                    ksid,
+                    {
+                        "channel": "iopub",
+                        "msg_type": "status",
+                        "header": {"msg_type": "status"},
+                        "parent_header": {"msg_id": parent_id},
+                        "content": {"execution_state": "idle"},
+                    },
+                )
+
+                reply = {
+                    "channel": "shell",
+                    "msg_type": "execute_reply",
+                    "header": {"msg_type": "execute_reply"},
+                    "parent_header": {"msg_id": parent_id},
+                    "content": (
+                        {"status": "ok"}
+                        if exec_status == "ok"
+                        else {"status": "error", "ename": ename, "evalue": evalue}
+                    ),
+                }
+                with wlock:
+                    with contextlib.suppress(OSError):
+                        sock.sendall(_ws_encode_server_frame(0x1, json.dumps(reply).encode("utf-8")))
+
+        class RpcHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args) -> None:  # noqa: A002
+                return
+
+            def _send_json(self, code: int, obj: object) -> None:
+                body = json.dumps(obj).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _caller_username(self) -> str:
+                auth = self.headers.get("Authorization") or ""
+                if "alt" in auth or "bbbb" in auth:
+                    return "user_alt"
+                return "user_main"
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length) if length else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+
+                if self.path == "/v1/security.OAuthService/IntrospectToken":
+                    tok = str(data.get("token") or "")
+                    uname = "user_alt" if "bbbb" in tok else "user_main"
+                    self._send_json(200, {"active": True, "username": uname})
+                    return
+
+                if self.path == "/v1/users.AccountService/GenerateAccessToken":
+                    rtok = str(data.get("refreshToken") or "")
+                    uname = "user_alt" if "alt" in rtok else "user_main"
+                    self._send_json(
+                        200,
+                        {
+                            "token": "KGAT_00000000000000000000000000000001",
+                            "expiresIn": 3600,
+                            "userName": uname,
+                            "userId": 101,
+                        },
+                    )
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/GetKernel":
+                    key = f"{data.get('userName')}/{data.get('kernelSlug')}"
+                    with state.lock:
+                        kinfo = state.kernels.get(key)
+                    if kinfo is None:
+                        self._send_json(404, {"code": 404, "message": "not found"})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "metadata": {"id": kinfo["kernelId"], "ref": f"/code/{key}", "title": kinfo["title"]},
+                            "blob": {"source": kinfo["text"], "language": "python", "kernelType": "notebook"},
+                        },
+                    )
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/SaveKernel":
+                    slug = str(data.get("slug") or "")
+                    with state.lock:
+                        state.save_calls.append(data)
+                        kid = 145548000 + len(state.save_calls)
+                        state.kernels[slug] = {
+                            "kernelId": kid,
+                            "title": data.get("newTitle", ""),
+                            "text": data.get("text", ""),
+                        }
+                    self._send_json(
+                        200,
+                        {
+                            "ref": f"/code/{slug}",
+                            "url": f"https://www.kaggle.com/code/{slug}",
+                            "versionNumber": 1,
+                            "kernelId": kid,
+                        },
+                    )
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/CreateKernelSession":
+                    with state.lock:
+                        state.create_session_calls.append(data)
+                        ksid = state.next_ksid
+                        state.next_ksid += 1
+                        op_name = f"operations/create-kernel-session/{ksid}"
+                        state.ops[op_name] = {"ksid": ksid, "polls": 0}
+                        state.live_sessions[ksid] = {
+                            "alive": True,
+                            "kernel_id": f"kid-{ksid}",
+                            "env": {},
+                            "In": [""],
+                        }
+                    self._send_json(
+                        200,
+                        {
+                            "name": op_name,
+                            "done": False,
+                            "metadata": {"kernelSessionId": ksid},
+                        },
+                    )
+                    return
+
+                if self.path == "/v1/common.OperationsService/GetOperation":
+                    op_name = str(data.get("name") or "")
+                    with state.lock:
+                        entry = state.ops.get(op_name)
+                        if entry is None:
+                            self._send_json(404, {"code": 404, "message": "operation not found"})
+                            return
+                        entry["polls"] = int(entry["polls"]) + 1
+                        polls = int(entry["polls"])
+                        ksid = int(entry["ksid"])
+                    if polls < 2:
+                        # Mirror real Kaggle behavior: metadata becomes null on subsequent GetOperation polls!
+                        self._send_json(200, {"name": op_name, "done": False, "metadata": None})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "name": op_name,
+                            "done": True,
+                            "metadata": None,
+                            "response": {
+                                "jupyterUrl": f"http://127.0.0.1:{state.proxy_port}/k/{ksid}/{state.proxy_secret}/proxy",
+                                "tokenizedJupyterUrl": f"http://127.0.0.1:{state.proxy_port}/?token={state.query_secret}",
+                            },
+                        },
+                    )
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/GetKernelSessionStatus":
+                    # Mirror real Kaggle behavior: returns COMPLETE even while interactive session is alive!
+                    self._send_json(200, {"status": "COMPLETE"})
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/CancelKernelSession":
+                    ksid = data.get("kernelSessionId")
+                    if not isinstance(ksid, int) or isinstance(ksid, bool):
+                        self._send_json(400, {"code": 400, "message": "kernelSessionId must be int"})
+                        return
+                    with state.lock:
+                        state.cancel_calls.append(ksid)
+                        if state.fail_cancel_code is not None:
+                            self._send_json(
+                                state.fail_cancel_code,
+                                {"code": state.fail_cancel_code, "message": "transient cancel failure"},
+                            )
+                            return
+                        if ksid in state.live_sessions:
+                            state.live_sessions[ksid]["alive"] = False
+                    self._send_json(200, {})
+                    return
+
+                if self.path == "/v1/kernels.KernelsApiService/DeleteKernel":
+                    with state.lock:
+                        state.delete_calls += 1
+                    self._send_json(200, {})
+                    return
+
+                self._send_json(404, {"code": 404, "message": f"unmocked RPC {self.path}"})
+
+        self._proxy_server = _ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        self.proxy_port = self._proxy_server.server_address[1]
+        state.proxy_port = self.proxy_port
+        self._proxy_thread = threading.Thread(target=self._proxy_server.serve_forever, daemon=True)
+        self._proxy_thread.start()
+
+        self._rpc_server = _ThreadingHTTPServer(("127.0.0.1", 0), RpcHandler)
+        rpc_port = self._rpc_server.server_address[1]
+        self.rpc_url = f"http://127.0.0.1:{rpc_port}"
+        self._rpc_thread = threading.Thread(target=self._rpc_server.serve_forever, daemon=True)
+        self._rpc_thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.state.close_all_ws()
+        if self._rpc_server is not None:
+            self._rpc_server.shutdown()
+            self._rpc_server.server_close()
+        if self._proxy_server is not None:
+            self._proxy_server.shutdown()
+            self._proxy_server.server_close()
+
+
+class SessionUnitTests(unittest.TestCase):
+    def test_stdlib_only_core_imports_without_kaggle_packages(self) -> None:
+        code = (
+            "import sys; "
+            "sys.meta_path = [f for f in sys.meta_path]; "
+            "import kaggle_ext.inject, kaggle_ext.diagnostics, kaggle_ext.accounts, "
+            "kaggle_ext.sessions, kaggle_ext.session_ws, kaggle_ext.skill_doc; "
+            "assert 'kaggle' not in sys.modules and 'kagglesdk' not in sys.modules"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _clean_env(home=Path(tmp) / "h", ext_home=Path(tmp) / "e", extra={"PYTHONPATH": str(REPO_ROOT)})
+            proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_validation_slug_hardware_redaction_and_inputs(self) -> None:
+        self.assertEqual(sessions.validate_session_name("gpu-worker_1.dev"), "gpu-worker_1.dev")
+        for bad in ("", "../evil", "-leading", "a" * 49):
+            with self.assertRaises(sessions.SessionError):
+                sessions.validate_session_name(bad)
+
+        self.assertEqual(sessions.normalize_kernel_ref("/code/deluxebear/my-nb"), ("deluxebear", "my-nb"))
+        self.assertEqual(
+            sessions.normalize_kernel_ref("https://www.kaggle.com/code/alice/demo-1"),
+            ("alice", "demo-1"),
+        )
+
+        full_slug, kslug, title = sessions.placeholder_slug_and_title("alice", "Train Worker 1".replace(" ", "-"))
+        self.assertEqual(full_slug, "alice/kaggle-ext-s-train-worker-1")
+        self.assertEqual(kslug, "kaggle-ext-s-train-worker-1")
+        self.assertEqual(title, "kaggle ext s train worker 1")
+
+        self.assertEqual(sessions.resolve_machine_shape("cpu"), (None, "cpu", None))
+        self.assertEqual(sessions.resolve_machine_shape("t4"), ("NvidiaTeslaT4", "NvidiaTeslaT4", None))
+        self.assertEqual(sessions.resolve_machine_shape("tpu"), ("TpuV5E8", "TpuV5E8", None))
+        shape, _lbl, warn = sessions.resolve_machine_shape("p100")
+        self.assertEqual(shape, "NvidiaTeslaP100")
+        self.assertIsNotNone(warn)
+
+        raw_secret_txt = (
+            "url=https://kkb-production.jupyter-proxy.kaggle.net/k/370558104/secretseg1234567890/proxy "
+            "alt=https://kkb-production.jupyter-proxy.kaggle.net/?token=querysecret999 "
+            "tok=KGAT_0123456789abcdef0123456789abcdef rt=KGRT_abc123 "
+            "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig123"
+        )
+        redacted = sessions.redact_session_secrets(raw_secret_txt)
+        for leak in ("secretseg1234567890", "querysecret999", "0123456789abcdef0123456789abcdef", "KGRT_abc123", "sig123"):
+            self.assertNotIn(leak, redacted)
+        self.assertIn("/k/370558104/[REDACTED]/proxy", redacted)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_f = tmp_path / ".env"
+            env_f.write_text("# comment\nexport FOO='bar baz'\nQUOTED=\"hello\\nworld\"\n", encoding="utf-8")
+            parsed_env = session_ws.parse_env_inputs(
+                env_list=["BAR=123", "FROM_ENV"],
+                env_file=str(env_f),
+                environ={"FROM_ENV": "env_ok"},
+            )
+            self.assertEqual(parsed_env, {"FOO": "bar baz", "QUOTED": "hello\nworld", "BAR": "123", "FROM_ENV": "env_ok"})
+
+            nb_path = tmp_path / "sample.ipynb"
+            nb_path.write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {"cell_type": "markdown", "source": "# ignore"},
+                            {"cell_type": "code", "source": ["# @title Init\n", "x = 1"]},
+                            {"cell_type": "code", "source": "   "},
+                            {"cell_type": "code", "source": "%%bash\necho hi", "id": "c3"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cells = session_ws.load_execution_cells(file_path=str(nb_path))
+            self.assertEqual(cells, [("Init", "# @title Init\nx = 1"), ("c3", "%%bash\necho hi")])
+            stdin_nb = session_ws.load_execution_cells(file_path="-", stdin_stream=io.StringIO(nb_path.read_text(encoding="utf-8")))
+            self.assertEqual(len(stdin_nb), 2)
+
+    def test_account_logout_scrubs_session_secrets_and_remove_guards_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_patch = _clean_env(home=tmp_path / "home", ext_home=tmp_path / "ext")
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                accounts.clear_startup_override(reset_initial_env=True)
+                try:
+                    accounts.ensure_account("worker_acct", username="u_worker", auth_method="access_token")
+                    sessions.upsert_session(
+                        "s1",
+                        {
+                            "username": "u_worker",
+                            "slug": "u_worker/kaggle-ext-s-s1",
+                            "kernel_session_id": 999111,
+                            "jupyter_url": "https://kkb-production.jupyter-proxy.kaggle.net/k/999111/secretseg/proxy",
+                            "tokenized_jupyter_url": "https://kkb-production.jupyter-proxy.kaggle.net/?token=qsec",
+                            "proxy_token": "ptok",
+                        },
+                        account="worker_acct",
+                    )
+                    with self.assertRaises(accounts.AccountError) as ctx:
+                        accounts.remove_account("worker_acct", force=False)
+                    self.assertIn("session stop --all", str(ctx.exception))
+
+                    accounts.clear_account_credentials("worker_acct")
+                    _lbl, rec = sessions.get_session("s1", account="worker_acct")
+                    assert rec is not None
+                    self.assertEqual(rec["kernel_session_id"], 999111)
+                    self.assertEqual(rec["state"], "logged_out")
+                    self.assertNotIn("jupyter_url", rec)
+                    self.assertNotIn("tokenized_jupyter_url", rec)
+                    self.assertNotIn("proxy_token", rec)
+
+                    accounts.remove_account("worker_acct", force=True)
+                finally:
+                    accounts.clear_startup_override(reset_initial_env=True)
+
+
+class SessionLoopbackIntegrationTests(unittest.TestCase):
+    REAL_PY = RealKaggleCliIntegrationTests.REAL_PY
+
+    @unittest.skipIf(REAL_PY is None, "kaggle package not installed in any detected Python environment")
+    def test_end_to_end_session_lifecycle_ws_exec_watch_and_redaction(self) -> None:
+        assert self.REAL_PY is not None
+        with tempfile.TemporaryDirectory() as tmp, _LoopbackKaggleCluster() as cluster:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            ext_home = tmp_path / "ext-home"
+            site_dir = tmp_path / "site"
+            site_dir.mkdir()
+            boot_dir = tmp_path / "boot"
+            boot_dir.mkdir()
+            (boot_dir / "sitecustomize.py").write_text(
+                f"import site\nsite.addsitedir({str(site_dir)!r})\n",
+                encoding="utf-8",
+            )
+            env = _clean_env(
+                home=home,
+                ext_home=ext_home,
+                extra={
+                    "PYTHONPATH": str(boot_dir),
+                    "KAGGLE_EXT_API_ENDPOINT": cluster.rpc_url,
+                },
+            )
+
+            p_inst = subprocess.run(
+                [self.REAL_PY, str(REPO_ROOT / "install.py"), "--site-dir", str(site_dir)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(p_inst.returncode, 0, p_inst.stderr)
+
+            def run_k(args: list[str], extra_env: dict[str, str] | None = None, timeout: int = 30):
+                run_env = dict(env)
+                if extra_env:
+                    run_env.update(extra_env)
+                return subprocess.run(
+                    [self.REAL_PY, "-m", "kaggle", *args],
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+
+            # 1. Offline unauthenticated `session list` works cleanly.
+            p_empty_ls = run_k(["session", "list", "--json"])
+            self.assertEqual(p_empty_ls.returncode, 0, p_empty_ls.stderr)
+            self.assertEqual(json.loads(p_empty_ls.stdout), [])
+
+            # 2. Configure two isolated accounts (`main_acct` OAuth + `alt` KGAT_ token).
+            accounts_cfg = home / ".config" / "kaggle-ext"
+            (accounts_cfg / "accounts" / "main_acct").mkdir(parents=True)
+            (accounts_cfg / "accounts" / "alt").mkdir(parents=True)
+            (accounts_cfg / "accounts" / "main_acct" / "credentials.json").write_text(
+                json.dumps(
+                    {
+                        "refresh_token": "KGRT_main_refresh",
+                        "access_token": "KGAT_11111111111111111111111111111111",
+                        "access_token_expiration": "2000-01-01T00:00:00+00:00",  # forces refresh via GenerateAccessToken
+                        "username": "user_main",
+                        "scopes": ["resources.admin:*"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (accounts_cfg / "accounts.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "active": "main_acct",
+                        "accounts": {
+                            "main_acct": {"username": "user_main", "auth_method": "oauth"},
+                            "alt": {"username": "user_alt", "auth_method": "access_token"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            p_tok_alt = run_k(
+                ["account", "login", "alt", "--token", "KGAT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+            )
+            self.assertEqual(p_tok_alt.returncode, 0, p_tok_alt.stderr)
+
+            # 3. Create GPU session `worker` on active account `main_acct`.
+            p_create = run_k(["session", "create", "worker", "--accelerator", "t4", "--json"])
+            self.assertEqual(p_create.returncode, 0, p_create.stderr)
+            created = json.loads(p_create.stdout)
+            self.assertFalse(created["reused"])
+            self.assertEqual(created["account"], "main_acct")
+            self.assertEqual(created["slug"], "user_main/kaggle-ext-s-worker")
+            self.assertEqual(created["machine_shape"], "NvidiaTeslaT4")
+            self.assertEqual(created["kernel_session_id"], 370558104)
+            self.assertNotIn(cluster.state.proxy_secret, p_create.stdout)
+            self.assertNotIn(cluster.state.query_secret, p_create.stdout)
+
+            # Verify SaveKernel sent private QUICK_SAVE empty notebook (`source == ""` str).
+            self.assertEqual(len(cluster.state.save_calls), 1)
+            sc = cluster.state.save_calls[0]
+            self.assertTrue(sc["isPrivate"])
+            self.assertEqual(sc["kernelExecutionType"], "QUICK_SAVE")
+            nb_saved = json.loads(str(sc["text"]))
+            self.assertIsInstance(nb_saved["cells"][0]["source"], str)
+            self.assertEqual(nb_saved["cells"][0]["source"], "")
+
+            # Verify sessions.json mode is 0600.
+            sess_file = accounts_cfg / "accounts" / "main_acct" / "sessions.json"
+            self.assertEqual(stat.S_IMODE(os.stat(sess_file).st_mode), 0o600)
+
+            # 4. Re-run create -> reuses live session without calling CreateKernelSession again.
+            p_reuse = run_k(["session", "create", "worker", "--json"])
+            self.assertEqual(p_reuse.returncode, 0, p_reuse.stderr)
+            self.assertTrue(json.loads(p_reuse.stdout)["reused"])
+            self.assertEqual(len(cluster.state.create_session_calls), 1)
+
+            # 5. Create TPU session `tpu_job` on `alt` (`--no-internet`).
+            p_alt_create = run_k(
+                ["-a", "alt", "session", "create", "tpu_job", "--accelerator", "tpu", "--no-internet", "--json"]
+            )
+            self.assertEqual(p_alt_create.returncode, 0, p_alt_create.stderr)
+            alt_created = json.loads(p_alt_create.stdout)
+            self.assertEqual(alt_created["account"], "alt")
+            self.assertEqual(alt_created["machine_shape"], "TpuV5E8")
+            self.assertFalse(alt_created["enable_internet"])
+            cs_alt = cluster.state.create_session_calls[1]
+            self.assertEqual(cs_alt["machineShape"], "TpuV5E8")
+            self.assertNotIn("dockerImage", cs_alt)
+
+            # Pinned-account auto-routing: `session status tpu_job` without `-a alt` resolves `alt`!
+            p_tpu_st = run_k(["sess", "status", "tpu_job", "--json"])
+            self.assertEqual(p_tpu_st.returncode, 0, p_tpu_st.stderr)
+            tpu_st = json.loads(p_tpu_st.stdout)
+            self.assertEqual(tpu_st["account"], "alt")
+            self.assertTrue(tpu_st["alive"])
+
+            # 6. Status check on `worker` returns alive even though RPC GetKernelSessionStatus returns COMPLETE.
+            p_st = run_k(["session", "status", "worker", "--json"])
+            self.assertEqual(p_st.returncode, 0, p_st.stderr)
+            self.assertTrue(json.loads(p_st.stdout)["alive"])
+
+            # 7. Exec with `--env` / `--env-file` hidden injection + check `len(In) == 2`.
+            env_file = tmp_path / "secrets.env"
+            env_file.write_text("SECRET_FROM_FILE=ENV_FILE_SECRET\n", encoding="utf-8")
+            p_exec = run_k(
+                [
+                    "session",
+                    "exec",
+                    "worker",
+                    "--env-file",
+                    str(env_file),
+                    "-e",
+                    "LOCAL_SECRET",
+                    "-c",
+                    "import os; print('EXEC_OUT', os.environ.get('SECRET_FROM_FILE'), os.environ.get('LOCAL_SECRET'), len(In))",
+                ],
+                extra_env={"LOCAL_SECRET": "LOCAL_VAL_99"},
+            )
+            self.assertEqual(p_exec.returncode, 0, p_exec.stderr)
+            self.assertIn("EXEC_OUT ENV_FILE_SECRET LOCAL_VAL_99 2", p_exec.stdout)
+
+            # Exec .ipynb where cell 2 fails -> cell 3 must NOT run and exit code must be 1.
+            nb_file = tmp_path / "fail_nb.ipynb"
+            nb_file.write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {"cell_type": "code", "source": "print('CELL1_OK')"},
+                            {"cell_type": "code", "source": "raise ValueError('boom_cell_2')"},
+                            {"cell_type": "code", "source": "print('CELL3_SHOULD_NOT_RUN')"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            p_nb = run_k(["session", "exec", "worker", "-f", str(nb_file), "--json"])
+            self.assertEqual(p_nb.returncode, 1)
+            nb_res = json.loads(p_nb.stdout)
+            self.assertFalse(nb_res["ok"])
+            self.assertEqual(nb_res["cells_executed"], 2)
+            self.assertIn("CELL1_OK", nb_res["stdout"])
+            self.assertNotIn("CELL3_SHOULD_NOT_RUN", nb_res["stdout"])
+            self.assertIn("boom_cell_2", nb_res["stderr"])
+
+            # Exec timeout -> exit code 124 and /interrupt triggered.
+            p_to = run_k(["session", "exec", "worker", "-c", "# SLEEP_UNTIL_INTERRUPT", "-t", "0.4"])
+            self.assertEqual(p_to.returncode, 124)
+            self.assertGreaterEqual(cluster.state.interrupts, 1)
+
+            # 8. Concurrent `watch` receives live iopub output without kicking `exec`.
+            cluster.state.ws_connected_event.clear()
+            watch_proc = subprocess.Popen(
+                [self.REAL_PY, "-m", "kaggle", "session", "watch", "worker", "-t", "3", "--json"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertTrue(cluster.state.ws_connected_event.wait(timeout=10.0))
+                p_ping = run_k(["session", "exec", "worker", "-c", "print('WATCH_PING')"])
+                self.assertEqual(p_ping.returncode, 0, p_ping.stderr)
+                w_out, w_err = watch_proc.communicate(timeout=10)
+                self.assertEqual(watch_proc.returncode, 0, w_err)
+                self.assertIn("WATCH_PING", w_out)
+                self.assertEqual(cluster.state.session_id_kicks, 0)
+            finally:
+                if watch_proc.poll() is None:
+                    watch_proc.kill()
+                    watch_proc.communicate()
+
+            # 9. Offline logs + restart.
+            p_logs = run_k(["session", "logs", "worker", "-n", "20"])
+            self.assertEqual(p_logs.returncode, 0, p_logs.stderr)
+            self.assertIn("WATCH_PING", p_logs.stdout)
+
+            p_rst = run_k(["session", "restart", "worker", "--json"])
+            self.assertEqual(p_rst.returncode, 0, p_rst.stderr)
+            self.assertEqual(cluster.state.restarts, 1)
+
+            # 10. Secret redaction across list, status, and `ext doctor`.
+            p_list_all = run_k(["session", "list", "--all-accounts", "--json"])
+            self.assertEqual(p_list_all.returncode, 0, p_list_all.stderr)
+            list_rows = json.loads(p_list_all.stdout)
+            self.assertEqual({(r["account"], r["name"]) for r in list_rows}, {("main_acct", "worker"), ("alt", "tpu_job")})
+
+            p_doc_json = run_k(["ext", "doctor", "--json"])
+            self.assertEqual(p_doc_json.returncode, 0, p_doc_json.stderr)
+            doc_data = json.loads(p_doc_json.stdout)
+            self.assertEqual(doc_data["sessions"]["count"], 1)
+
+            p_doc_txt = run_k(["ext", "doctor"])
+            self.assertEqual(p_doc_txt.returncode, 0, p_doc_txt.stderr)
+            self.assertIn("sessions        : 1 recorded (worker", p_doc_txt.stdout)
+
+            combined_outputs = "\n".join(
+                [p_list_all.stdout, p_tpu_st.stdout, p_st.stdout, p_doc_json.stdout, p_doc_txt.stdout]
+            )
+            for secret_val in (cluster.state.proxy_secret, cluster.state.query_secret, "KGRT_main_refresh", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"):
+                self.assertNotIn(secret_val, combined_outputs)
+
+            # 11. Stop preserves local state on transient HTTP 500, deletes on success, never deletes placeholder kernel.
+            cluster.state.fail_cancel_code = 500
+            p_stop_fail = run_k(["session", "stop", "worker"])
+            self.assertNotEqual(p_stop_fail.returncode, 0)
+            self.assertIn("worker", json.loads(sess_file.read_text(encoding="utf-8"))["sessions"])
+
+            cluster.state.fail_cancel_code = None
+            p_stop_ok = run_k(["session", "stop", "worker", "--json"])
+            self.assertEqual(p_stop_ok.returncode, 0, p_stop_ok.stderr)
+            self.assertNotIn("worker", json.loads(sess_file.read_text(encoding="utf-8"))["sessions"])
+            self.assertEqual(cluster.state.delete_calls, 0)
+
+            p_dead_st = run_k(["session", "status", "worker"])
+            self.assertNotEqual(p_dead_st.returncode, 0)
+
+            p_stop_alt = run_k(["-a", "alt", "session", "stop", "--all", "--json"])
+            self.assertEqual(p_stop_alt.returncode, 0, p_stop_alt.stderr)
+            self.assertEqual(len(cluster.state.cancel_calls), 3)  # 1 failed + 2 succeeded
+            self.assertEqual(cluster.state.delete_calls, 0)
 
 
 if __name__ == "__main__":

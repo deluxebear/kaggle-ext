@@ -18,13 +18,13 @@
    - 任何扩展代码异常（缺文件、半更新状态、上游 API 签名变更）**绝不允许阻断原生 `kaggle` 命令执行**。
    - `.pth` 入口与 `kaggle_ext_loader.py` / `kaggle_ext.register()` 必须捕获扩展自身异常；默认保持静默或单行告警，仅在 `KAGGLE_EXT_DEBUG=1` 时向 `stderr` 输出完整 traceback 诊断信息。
 4. **底座纯 Python 标准库（Stdlib-Only Core）**
-   - `install.py`、`kaggle_ext_loader.py`、`kaggle_ext/inject.py`、`kaggle_ext/diagnostics.py`、`kaggle_ext/accounts.py`、`kaggle_ext/skill_doc.py` 与 `kaggle_ext/skill_commands.py` 必须严格仅依赖 Python 3.11+ 标准库，确保任意系统 `python3` 均可完成安装、自检、账户解析、离线诊断与 Skill 文档检索。
+   - `install.py`、`kaggle_ext_loader.py`、`kaggle_ext/inject.py`、`kaggle_ext/diagnostics.py`、`kaggle_ext/accounts.py`、`kaggle_ext/sessions.py`、`kaggle_ext/session_ws.py`、`kaggle_ext/skill_doc.py` 与 `kaggle_ext/skill_commands.py` 必须严格仅依赖 Python 3.11+ 标准库，确保任意系统 `python3` 均可完成安装、自检、账户解析、会话存储、RFC 6455 WebSocket、离线诊断与 Skill 文档检索。
 5. **严禁泄露真实凭据**
-   - 日志、报错、`kaggle ext doctor` / `--json` 输出及测试断言中，严禁打印或返回真实 `KGAT_*` token、`KGRT_*` refresh token、`kaggle.json` 中的 `key` 字段或 OAuth `access_token`。
+   - 日志、报错、`kaggle ext doctor` / `kaggle session list/status` / `--json` 输出及测试断言中，严禁打印或返回真实 `KGAT_*` token、`KGRT_*` refresh token、`kaggle.json` 中的 `key` 字段、OAuth `access_token`，以及 Kaggle Jupyter Proxy URL 中内嵌的路径密钥（`/k/<id>/<seg>`）或查询参数（`?token=...`）。
 
 ---
 
-## 2. 上游 `Kaggle/kaggle-cli` 内部机制与五大陷阱清单
+## 2. 上游 `Kaggle/kaggle-cli` 内部机制与实测陷阱清单
 
 已基于本地实装 `Kaggle CLI 2.2.5`（`kaggle` + `kagglesdk`）源码核实以下关键行为，新增任何 Hook 必须严格遵守：
 
@@ -55,6 +55,12 @@
    - `kagglesdk.kaggle_http_client._get_apikey_creds()`：同样硬编码读取 `~/.kaggle/kaggle.json`，未修补时会在新账号未登录执行 OAuth 换取 Token 时泄露旧账号请求头。
 5. **Linux Wayland 浏览器检测缺陷**
    - `KaggleOAuth._can_open_browser()` 在 Linux 上仅检查 `os.environ.get("DISPLAY")`，在纯 Wayland（仅设 `WAYLAND_DISPLAY`、未设 `DISPLAY`）桌面会误判为无浏览器环境。`cli_hooks.py` 已在 Linux + `WAYLAND_DISPLAY` + `xdg-open` 可用时自动修补为返回 `True`。
+6. **交互式会话（`CreateKernelSession` / Jupyter Proxy）实测契约陷阱（Gate 0 核实）**
+   - **Proto-RPC 路由与 OAuth 鉴权顺序**：`KaggleHttpClient` 发送 `POST /v1/{service}/{method}` 而非 `request.endpoint()`，且 `_try_fill_auth()` 不读 `credentials.json`；OAuth 账号必须先调用 `api.authenticate()` 填入短期 `token` 后再调用 `api.build_kaggle_client()`。
+   - **`SaveKernel.ref` `/code/` 前缀**：`ApiSaveKernelResponse.ref` 返回 `"/code/<owner>/<slug>"`，空 `.ipynb` 单元格 `source` 须为 `str`（`""`）而非 `list`；传给其他 SDK 接口前必须剥离 `/code/`。
+   - **早期锁存 `kernelSessionId`**：初始 `CreateKernelSession` 返回的 `Operation.metadata` 含 `{"kernelSessionId": <int>}`，但在 `GetOperation` 轮询与终态时 `metadata` 会变为 `null`；须在初始响应即刻提取并落盘 `"starting"` 状态，且最终 `response` 中的 `jupyterUrl`（`/k/<id>/<seg>/proxy`）与 `tokenizedJupyterUrl`（`?token=...`）均直接内嵌密钥，须严格脱敏。
+   - **`GetKernelSessionStatus` 非交互式真值**：交互式会话运行期间 `GetKernelSessionStatus` 仍返回 `COMPLETE`（反映保存版本状态）；存活探活必须以代理 `GET {jupyter_url}/api/kernels`（`HTTP 200`）为准。
+   - **全局 `-a` 与独立监控 `session_id`**：`extract_account_from_argv()` 在 `parse_args()` 前剥离所有 `-a`，故扩展子命令禁止绑定 `-a` 短参数（如 `--all-accounts`/`--all`）；只读监控（`watch`/`logs -f`）必须生成全新 `session_id` UUID，避免踢断并发的 `exec` 连接。
 
 ---
 
@@ -76,6 +82,10 @@ kaggle-ext/
 │   ├── cli_hooks.py          # 双阶段 Hook 注册中心与 KaggleApi / kagglesdk 隔离拦截器
 │   ├── diagnostics.py        # 离线、只读、脱敏的 Kaggle 凭据与环境体检
 │   ├── account_commands.py   # `kaggle account` (`acct`) 多账户管理与多种登录方式
+│   ├── sessions.py           # 多账户隔离 sessions.json 存储、锁、硬件映射与 URL 脱敏（纯 stdlib）
+│   ├── session_ws.py         # 纯 stdlib Jupyter Proxy HTTP & RFC 6455 asyncio WebSocket 客户端
+│   ├── session_client.py     # 私有空壳占位 Kernel、CreateKernelSession 轮询与取消编排
+│   ├── session_commands.py   # `kaggle session` (`sess`) CLI 命令组
 │   ├── skill_doc.py          # 离线 AI Agent Skill 文档合并、主题解析与导出引擎（纯 stdlib）
 │   ├── skill_commands.py     # `kaggle skill` (`SKILL`) 命令实现与上游前瞻兼容包装
 │   ├── commands.py           # `kaggle ext {doctor,status,install,uninstall,version}`
@@ -87,9 +97,9 @@ kaggle-ext/
 ### Hook 扩展点（后续功能统一在此注册，不散落 monkey-patch）
 - `cli_hooks.register_pre_api_hook(fn)`：在 `kaggle.api.kaggle_api_extended` 执行前运行（用于提前解析 `-a` / `KAGGLE_ACCOUNT` 并在 `KaggleApi.config_dir` 求值前切换隔离目录）。
 - `cli_hooks.register_root_parser_hook(fn)`：在根 `ArgumentParser` 构建完成后、`parse_args()` 前运行（用于注册 `-a / --account` 等全局 flag）。
-- `cli_hooks.register_subparsers_hook(fn, *, choices=..., help_line=...)`：向根 `subparsers` 挂载新命令组（如 `ext`、`account`、`skill`）。
+- `cli_hooks.register_subparsers_hook(fn, *, choices=..., help_line=...)`：向根 `subparsers` 挂载新命令组（如 `ext`、`account`、`session`、`skill`）。
 - `cli_hooks.register_parsed_args_hook(fn)`：在 `parse_args()` 返回后、`args.func(**command_args)` 调用前运行（消费并 `delattr` 扩展全局参数）。
-- `cli_hooks.OFFLINE_EXTENSION_COMMANDS`：无需 Kaggle 登录即可运行的扩展顶层命令集合（含 `"ext"`, `"account"`, `"acct"`, `"skill"`, `"SKILL"`）。
+- `cli_hooks.OFFLINE_EXTENSION_COMMANDS`：无需 Kaggle 登录即可运行的扩展顶层命令集合（含 `"ext"`, `"account"`, `"acct"`, `"session"`, `"sess"`, `"skill"`, `"SKILL"`；其中 `session` 在子命令内部按需鉴权以支持跨账户路由）。
 
 ---
 
@@ -98,6 +108,7 @@ kaggle-ext/
 - **Phase 1（已完成）**：零侵扰 `.pth` + `sys.meta_path` 注入底座、`install.py` / `install.sh`、`kaggle ext {doctor, status, install, uninstall, version}` 与全套隔离测试。
 - **Phase 2（已完成）**：多账户隔离与切换（`kaggle account` / `acct`、全局 `-a / --account`、`KAGGLE_ACCOUNT`、两步式无头 `--url-only` / `--code` OAuth、Token/kaggle.json 导入及 Wayland 浏览器检测修补），统一隔离 `kaggle.json`、`access_token` 与 `credentials.json`。
 - **Phase 3（已完成）**：`kaggle skill`（`SKILL`）命令，内置并动态合并上游 `Kaggle/kaggle-cli/skills/`（`SKILL.md` + 13 篇 `references/*.md`）与 `kaggle-ext` 扩展/多账户文档，支持 `--list`、按主题检索（含 `account` / `ext`）、`--all`、`--raw`、`--export` 及 `--json`。
+- **Phase 4（已完成）**：`kaggle session`（`sess`）交互式会话与纯标准库 RFC 6455 Jupyter WebSocket 执行/监控层（私有 `QUICK_SAVE` 空壳占位、`CreateKernelSession` + `GetOperation` 轮询、`0600` 分账户 `sessions.json`、隐式内存注密、`.py`/`.ipynb` 逐格执行、独立 `session_id` 只读监控及本地回环 RPC/WS 全隔离回归测试）。
 
 ---
 

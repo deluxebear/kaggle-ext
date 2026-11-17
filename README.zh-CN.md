@@ -71,6 +71,23 @@ kaggle ext uninstall            # 移除 kaggle_ext.pth
 kaggle ext version              # 输出扩展版本与环境路径 JSON
 ```
 
+### 交互式会话与 WebSocket 执行（`kaggle session` / `sess`）
+
+在后台维护私有的空壳占位 Notebook（`<username>/kaggle-ext-s-<name>`，仅 `QUICK_SAVE` 不执行），并通过纯标准库 RFC 6455 WebSocket 实时下发代码与内存环境变量（业务代码与密钥不落盘到云端 Notebook）：
+
+```bash
+kaggle session create worker --accelerator NvidiaTeslaT4 --internet
+kaggle session list [--all-accounts] [--json]
+kaggle session status worker [--json]
+kaggle session exec worker -f train.ipynb --env-file .env
+kaggle session exec worker -c "print('hello')" --env API_KEY
+kaggle session watch worker [--timeout 60] [--json]
+kaggle session logs worker [-n 100] [-f]
+kaggle session restart worker
+kaggle session interrupt worker
+kaggle session stop worker [--all]
+```
+
 ### AI Agent Skill 指引与参考文档（`kaggle skill` / `SKILL`）
 
 上游 `Kaggle/kaggle-cli` 的 `SKILL.md` 及 `references/*.md` 仅存于源码仓库、未打包进 PyPI wheel。`kaggle-ext` 离线内置全部 13 篇上游参考文档，并与多账户管理/扩展指引无缝合并：
@@ -102,6 +119,7 @@ kaggle skill --export ./kaggle-cli    # 将 SKILL.md 与 references/ 目录导�
 - **Phase 1（已完成）**：无侵扰 `.pth` + `sys.meta_path` 底座、`install.py` / `install.sh`、`kaggle ext {doctor, status, install, uninstall, version}`。
 - **Phase 2（已完成）**：多账户隔离与切换（`kaggle account` / `-a` / `KAGGLE_ACCOUNT`）、无头两步式 PKCE OAuth（`--url-only` / `--code`）、Token/kaggle.json 导入及 Linux Wayland 浏览器唤起兼容。
 - **Phase 3（已完成）**：离线 AI Agent Skill 指引命令（`kaggle skill`），内置并融合上游 `Kaggle/kaggle-cli` 技能文档（`SKILL.md` + 13 篇 `references/*.md`）与扩展指令，支持主题检索与 `--export` 导出。
+- **Phase 4（已完成）**：交互式会话与纯标准库 RFC 6455 Jupyter WebSocket 执行/监控层（`kaggle session` / `sess`），支持私有 `QUICK_SAVE` 空壳占位、分账户 `0600` `sessions.json`、隐式帧 `--env` 注密、只读 `iopub` 监控与全脱敏输出。
 
 ## 测试
 

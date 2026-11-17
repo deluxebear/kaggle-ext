@@ -14,6 +14,8 @@ import stat
 import sys
 from typing import Mapping
 
+from . import sessions
+
 _ACCESS_TOKEN_RE = re.compile(r"^KGAT_[0-9a-fA-F]{32}$")
 _SAFE_CONFIG_KEYS = ("path", "competition", "proxy", "ssl_ca_cert")
 
@@ -255,3 +257,49 @@ def inspect_kaggle_auth_offline(
             "wayland_only_oauth_quirk": wayland_quirk,
         },
     }
+
+
+def inspect_sessions_offline(config_dir: str | None) -> dict:
+    """Inspect `sessions.json` inside `config_dir` offline without mutating disk or returning secrets."""
+    path = os.path.join(config_dir, "sessions.json") if config_dir else None
+    info: dict = {
+        "path": path,
+        "present": bool(path and os.path.isfile(path)),
+        "mode": None,
+        "world_readable": False,
+        "valid_json": None,
+        "count": 0,
+        "sessions": [],
+    }
+    if not path or not info["present"]:
+        return info
+
+    try:
+        st_mode = os.stat(path).st_mode
+        info["mode"] = oct(stat.S_IMODE(st_mode))
+        if os.name != "nt":
+            info["world_readable"] = bool(st_mode & (stat.S_IROTH | stat.S_IRGRP))
+    except OSError:
+        pass
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        info["valid_json"] = False
+        return info
+
+    if not isinstance(raw, dict):
+        info["valid_json"] = False
+        return info
+
+    info["valid_json"] = True
+    sessions_map = raw.get("sessions") if isinstance(raw.get("sessions"), dict) else raw
+    sanitized: list[dict] = []
+    for sname in sorted(k for k in sessions_map.keys() if isinstance(k, str) and k != "version"):
+        rec = sessions_map.get(sname)
+        if isinstance(rec, dict):
+            sanitized.append(sessions.sanitize_session_record(sname, rec))
+    info["count"] = len(sanitized)
+    info["sessions"] = sanitized
+    return info

@@ -96,6 +96,10 @@ def oauth_pending_path(name: str) -> str:
     return os.path.join(account_dir(name), "oauth_pending.json")
 
 
+def sessions_file_path(name: str) -> str:
+    return os.path.join(account_dir(name), "sessions.json")
+
+
 def validate_account_name(name: str) -> str:
     if not name or not isinstance(name, str) or ".." in name or not ACCOUNT_RE.fullmatch(name):
         raise AccountError(
@@ -430,6 +434,11 @@ def clear_account_credentials(name: str) -> list[str]:
             entry["auth_method"] = None
             entry["updated_at"] = _now_iso()
             _save_registry(reg)
+
+    with contextlib.suppress(Exception):
+        from . import sessions
+
+        sessions.scrub_account_session_secrets(name)
     return removed
 
 
@@ -445,6 +454,21 @@ def remove_account(identifier: str, *, force: bool = False) -> tuple[str, dict[s
                 f"Account {resolved!r} still has stored credentials ({info['auth_method']}). "
                 "Re-run with `--force` to delete it and its credentials."
             )
+        if not force:
+            from . import sessions
+
+            _lbl, active_sessions = sessions.load_sessions(resolved)
+            with_ids = sorted(
+                sname
+                for sname, srec in active_sessions.items()
+                if isinstance(srec, dict) and srec.get("kernel_session_id")
+            )
+            if with_ids:
+                raise AccountError(
+                    f"Account {resolved!r} still has recorded interactive session(s) "
+                    f"({', '.join(with_ids)}). Stop them with "
+                    f"`kaggle -a {resolved} session stop --all` or re-run with `--force`."
+                )
 
         acct_path = account_dir(resolved)
         if os.path.exists(acct_path):

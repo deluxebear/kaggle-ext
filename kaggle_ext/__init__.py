@@ -10,10 +10,11 @@ from __future__ import annotations
 import os
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 REGISTERED_ATTR = "_kaggle_ext_registered"
 ACCOUNT_HELP = "Manage multiple isolated Kaggle accounts and credentials (alias: acct)"
 EXT_HELP = "Diagnose, repair, or inspect the kaggle-ext CLI extension"
+SESSION_HELP = "Manage interactive Kaggle Jupyter sessions and WebSocket execution (alias: sess)"
 SKILL_HELP = "Print AI agent skill documentation and command references"
 
 
@@ -30,11 +31,12 @@ def register(cli_mod=None, *, force: bool = False) -> bool:
         return False
 
     try:
-        from . import account_commands, cli_hooks, commands, skill_commands
+        from . import account_commands, cli_hooks, commands, session_commands, skill_commands
 
         cli_hooks.register_multi_account_hooks()
         account_commands.register_account_commands()
         commands.register_commands()
+        session_commands.register_session_commands()
         skill_commands.register_skill_commands()
 
         api_mod = sys.modules.get("kaggle.api.kaggle_api_extended")

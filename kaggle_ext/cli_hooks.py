@@ -17,7 +17,15 @@ from typing import Callable
 
 from . import accounts
 
-OFFLINE_EXTENSION_COMMANDS: set[str] = {"ext", "account", "acct", "skill", "SKILL"}
+OFFLINE_EXTENSION_COMMANDS: set[str] = {
+    "ext",
+    "account",
+    "acct",
+    "skill",
+    "SKILL",
+    "session",
+    "sess",
+}
 
 _pre_api_hooks: list[Callable[[], None]] = []
 _root_parser_hooks: list[Callable[[object], None]] = []
@@ -398,6 +406,23 @@ def _patch_kagglesdk(api_mod, *, force: bool = False) -> None:
         oauth_cls._kaggle_ext_orig_can_open_browser = orig_can_open
         oauth_cls._can_open_browser = _wrapped_can_open_browser
         oauth_cls._kaggle_ext_browser_patched = True
+
+    # 5. Optional internal API endpoint override (used by hermetic loopback integration tests).
+    hc_cls = getattr(http_client_mod, "KaggleHttpClient", None)
+    if hc_cls is not None and (force or not getattr(hc_cls, "_kaggle_ext_endpoint_patched", False)):
+        orig_hc_init = getattr(hc_cls, "_kaggle_ext_orig_init", hc_cls.__init__)
+
+        @functools.wraps(orig_hc_init)
+        def _wrapped_hc_init(self, *args, **kwargs):
+            orig_hc_init(self, *args, **kwargs)
+            custom_ep = (os.environ.get("KAGGLE_EXT_API_ENDPOINT") or "").strip()
+            if custom_ep:
+                self._endpoint = custom_ep.rstrip("/")
+                self._env = kaggle_env_mod.KaggleEnv.PROD
+
+        hc_cls._kaggle_ext_orig_init = orig_hc_init
+        hc_cls.__init__ = _wrapped_hc_init
+        hc_cls._kaggle_ext_endpoint_patched = True
 
 
 def patch_api_module(api_mod, *, force: bool = False) -> None:

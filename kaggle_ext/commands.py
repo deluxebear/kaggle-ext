@@ -22,6 +22,7 @@ def _cmd_doctor(json_output: bool = False) -> None:
     acct_dir = accounts.account_dir(acct) if reg_exists and os.path.isdir(accounts.account_dir(acct)) else None
 
     auth = diagnostics.inspect_kaggle_auth_offline(account_dir_override=acct_dir)
+    sess_diag = diagnostics.inspect_sessions_offline(acct_dir)
     registered = inject.reload_ok()
     multi_account = {
         "registry_path": accounts.registry_path(),
@@ -37,6 +38,7 @@ def _cmd_doctor(json_output: bool = False) -> None:
         **st,
         "multi_account": multi_account,
         "kaggle_auth": auth,
+        "sessions": sess_diag,
     }
     if json_output:
         print(json.dumps(payload, indent=2, default=str))
@@ -112,6 +114,24 @@ def _cmd_doctor(json_output: bool = False) -> None:
             "  NOTE: WAYLAND_DISPLAY is set without DISPLAY; upstream `kaggle auth login` "
             "may fall back to manual URL mode unless DISPLAY is set."
         )
+
+    if sess_diag["present"]:
+        if sess_diag["valid_json"] is False:
+            print("  sessions        : present (%s, INVALID JSON)" % sess_diag["path"])
+        else:
+            names = [str(item["name"]) for item in sess_diag["sessions"]]
+            summary = ", ".join(names) if names else "none"
+            print(
+                "  sessions        : %d recorded (%s, mode: %s)"
+                % (sess_diag["count"], summary, sess_diag["mode"] or "?")
+            )
+            if sess_diag["world_readable"]:
+                print(
+                    "  WARN: %s is readable by others; run `chmod 600 %s`"
+                    % (sess_diag["path"], sess_diag["path"])
+                )
+    else:
+        print("  sessions        : none (%s)" % (sess_diag["path"] or "uninitialized"))
 
 
 def _cmd_install(site_dir: str | None = None, link: bool = False, quiet: bool = False) -> None:
